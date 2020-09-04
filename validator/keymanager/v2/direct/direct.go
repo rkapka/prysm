@@ -277,6 +277,79 @@ func (dr *Keymanager) CreateAccount(ctx context.Context) ([]byte, error) {
 	return validatingKey.PublicKey().Marshal(), nil
 }
 
+// CreateAccountPriv creates a new validator account with a given private key.
+func (dr *Keymanager) CreateAccountPriv(ctx context.Context, privKey []byte) ([]byte, error) {
+	// Create a petname for an account from its public key and write its password to disk.
+	validatingKey, err := bls.SecretKeyFromBytes(privKey)
+	if err != nil {
+		return nil, errors.Wrap(err, "could not create secret key")
+	}
+	accountName := petnames.DeterministicName(validatingKey.PublicKey().Marshal(), "-")
+	dr.accountsStore.PrivateKeys = append(dr.accountsStore.PrivateKeys, validatingKey.Marshal())
+	dr.accountsStore.PublicKeys = append(dr.accountsStore.PublicKeys, validatingKey.PublicKey().Marshal())
+	newStore, err := dr.createAccountsKeystore(ctx, dr.accountsStore.PrivateKeys, dr.accountsStore.PublicKeys)
+	if err != nil {
+		return nil, errors.Wrap(err, "could not create accounts keystore")
+	}
+
+	// Generate a withdrawal key and confirm user
+	// acknowledgement of a 256-bit entropy mnemonic phrase.
+	withdrawalKey := bls.RandKey()
+	log.Info(
+		"Write down the private key, as it is your unique " +
+			"withdrawal private key for eth2",
+	)
+	fmt.Printf(`
+==========================Withdrawal Key===========================
+
+%#x
+
+===================================================================
+	`, withdrawalKey.Marshal())
+	fmt.Println(" ")
+
+	// Upon confirmation of the withdrawal key, proceed to display
+	// and write associated deposit data to disk.
+	tx, data, err := depositutil.GenerateDepositTransaction(validatingKey, withdrawalKey)
+	if err != nil {
+		return nil, errors.Wrap(err, "could not generate deposit transaction data")
+	}
+	domain, err := helpers.ComputeDomain(
+		params.BeaconConfig().DomainDeposit,
+		nil, /*forkVersion*/
+		nil, /*genesisValidatorsRoot*/
+	)
+	if err := depositutil.VerifyDepositSignature(data, domain); err != nil {
+		return nil, errors.Wrap(err, "failed to verify deposit signature, please make sure your account was created properly")
+	}
+
+	// Log the deposit transaction data to the user.
+	fmt.Printf(`
+==================Eth1 Deposit Transaction Data=================
+%#x
+================Verified for the %s network================`, tx.Data(), params.BeaconConfig().NetworkName)
+	fmt.Println("")
+
+	// Write the encoded keystore.
+	encoded, err := json.MarshalIndent(newStore, "", "\t")
+	if err != nil {
+		return nil, err
+	}
+	if err := dr.wallet.WriteFileAtPath(ctx, AccountsPath, accountsKeystoreFileName, encoded); err != nil {
+		return nil, errors.Wrap(err, "could not write keystore file for accounts")
+	}
+
+	log.WithFields(logrus.Fields{
+		"name": accountName,
+	}).Info("Successfully created new validator account")
+
+	err = dr.initializeKeysCachesFromKeystore()
+	if err != nil {
+		return nil, errors.Wrap(err, "failed to initialize keys caches")
+	}
+	return validatingKey.PublicKey().Marshal(), nil
+}
+
 // DeleteAccounts takes in public keys and removes the accounts entirely. This includes their disk keystore and cached keystore.
 func (dr *Keymanager) DeleteAccounts(ctx context.Context, publicKeys [][]byte) error {
 	for _, publicKey := range publicKeys {
