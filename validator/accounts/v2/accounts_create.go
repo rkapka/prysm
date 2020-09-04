@@ -111,3 +111,53 @@ func CreateAccount(ctx context.Context, cfg *CreateAccountConfig) error {
 	}
 	return nil
 }
+
+// CreateAccountPriv creates a new validator account with a given private key for a derived wallet.
+func CreateAccountPriv(ctx context.Context, cfg *CreateAccountConfig, privKey []byte) error {
+	keymanager, err := cfg.Wallet.InitializeKeymanager(ctx, false /* skip mnemonic confirm */)
+	if err != nil && strings.Contains(err.Error(), "invalid checksum") {
+		return errors.New("wrong wallet password entered")
+	}
+	if err != nil {
+		return errors.Wrap(err, "could not initialize keymanager")
+	}
+	switch cfg.Wallet.KeymanagerKind() {
+	case v2keymanager.Remote:
+		return errors.New("cannot create a new account for a remote keymanager")
+	case v2keymanager.Direct:
+		km, ok := keymanager.(*direct.Keymanager)
+		if !ok {
+			return errors.New("not a direct keymanager")
+		}
+		// Create a new validator account using the specified keymanager.
+		if _, err := km.CreateAccountPriv(ctx, privKey); err != nil {
+			return errors.Wrap(err, "could not create account in wallet")
+		}
+	case v2keymanager.Derived:
+		km, ok := keymanager.(*derived.Keymanager)
+		if !ok {
+			return errors.New("not a derived keymanager")
+		}
+		startNum := km.NextAccountNumber(ctx)
+		if cfg.NumAccounts == 1 {
+			if _, err := km.CreateAccount(ctx, true /*logAccountInfo*/); err != nil {
+				return errors.Wrap(err, "could not create account in wallet")
+			}
+		} else {
+			for i := 0; i < int(cfg.NumAccounts); i++ {
+				if _, err := km.CreateAccount(ctx, false /*logAccountInfo*/); err != nil {
+					return errors.Wrap(err, "could not create account in wallet")
+				}
+			}
+			log.Infof(
+				"Successfully created %d accounts. Please use accounts-v2 list to view details for accounts %d through %d",
+				cfg.NumAccounts,
+				startNum,
+				startNum+uint64(cfg.NumAccounts)-1,
+			)
+		}
+	default:
+		return fmt.Errorf("keymanager kind %s not supported", cfg.Wallet.KeymanagerKind())
+	}
+	return nil
+}
