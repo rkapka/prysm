@@ -321,6 +321,11 @@ var (
 		Usage: "Enables the web portal for the validator client (work in progress)",
 		Value: false,
 	}
+	PrivKeyFlag = &cli.StringFlag{
+		Name:  "priv-key",
+		Usage: "Account private key",
+		Value: "",
+	}
 )
 
 // Deprecated flags list.
