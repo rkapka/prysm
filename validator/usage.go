@@ -103,6 +103,7 @@ var appHelpFlagGroups = []flagGroup{
 			flags.WalletDirFlag,
 			flags.DeprecatedPasswordsDirFlag,
 			flags.WalletPasswordFileFlag,
+			flags.PrivKeyFlag,
 		},
 	},
 	{
