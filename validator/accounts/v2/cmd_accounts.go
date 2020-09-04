@@ -39,6 +39,25 @@ this command outputs a deposit data string which is required to become a validat
 			},
 		},
 		{
+			Name:        "create-priv",
+			Description: `creates a new validator account with a given private key for a derived wallet`,
+			Flags: []cli.Flag{
+				flags.PrivKeyFlag,
+				flags.WalletDirFlag,
+				flags.WalletPasswordFileFlag,
+				flags.AccountPasswordFileFlag,
+				featureconfig.AltonaTestnet,
+				featureconfig.OnyxTestnet,
+			},
+			Action: func(cliCtx *cli.Context) error {
+				featureconfig.ConfigureValidator(cliCtx)
+				if err := CreateAccountCliPriv(cliCtx); err != nil {
+					log.Fatalf("Could not create new account: %v", err)
+				}
+				return nil
+			},
+		},
+		{
 			Name:        "delete",
 			Description: `deletes the selected accounts from a users wallet.`,
 			Flags: []cli.Flag{
