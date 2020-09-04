@@ -2,7 +2,9 @@ package v2
 
 import (
 	"context"
+	"encoding/hex"
 	"fmt"
+	"strconv"
 	"strings"
 
 	"github.com/pkg/errors"
@@ -36,6 +38,27 @@ func CreateAccountCli(cliCtx *cli.Context) error {
 		Wallet:      wallet,
 		NumAccounts: numAccounts,
 	})
+}
+
+// CreateAccountCliPriv creates a new validator account from user input by opening
+// a wallet from the user's specified path. This uses the CLI to extract information
+// to perform account creation.
+func CreateAccountCliPriv(cliCtx *cli.Context) error {
+	wallet, err := OpenWalletOrElseCli(cliCtx, CreateAndSaveWalletCli)
+	if err != nil {
+		return err
+	}
+	numAccounts := cliCtx.Int64(flags.NumAccountsFlag.Name)
+	log.Info("Creating a new account...")
+	privKey, err := hex.DecodeString(cliCtx.String(flags.PrivKeyFlag.Name))
+	if err != nil {
+		return errors.Wrap(err, "private key is not a 32-byte hex")
+	}
+	log.Infof(strconv.Itoa(len(privKey)))
+	return CreateAccountPriv(cliCtx.Context, &CreateAccountConfig{
+		Wallet:      wallet,
+		NumAccounts: numAccounts,
+	}, privKey)
 }
 
 // CreateAccount creates a new validator account from user input by opening
