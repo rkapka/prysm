@@ -55,7 +55,7 @@ func setupValidExit(t *testing.T) (*ethpb.SignedVoluntaryExit, *stateTrie.Beacon
 
 	val, err := state.ValidatorAtIndex(0)
 	require.NoError(t, err)
-	val.PublicKey = priv.PublicKey().Marshal()[:]
+	val.PublicKey = priv.PublicKey().Marshal()
 	require.NoError(t, state.UpdateValidatorAtIndex(0, val))
 
 	b := make([]byte, 32)
@@ -96,6 +96,39 @@ func TestValidateVoluntaryExit_ValidExit(t *testing.T) {
 	valid := r.validateVoluntaryExit(ctx, "", m) == pubsub.ValidationAccept
 	assert.Equal(t, true, valid, "Failed validation")
 	assert.NotNil(t, m.ValidatorData, "Decoded message was not set on the message validator data")
+}
+
+func TestValidateVoluntaryExit_InvalidExitSlot(t *testing.T) {
+	p := p2ptest.NewTestP2P(t)
+	ctx := context.Background()
+
+	exit, s := setupValidExit(t)
+	// Set state slot to 1 to cause exit object fail to verify.
+	require.NoError(t, s.SetSlot(1))
+	c, err := lru.New(10)
+	require.NoError(t, err)
+	r := &Service{
+		p2p: p,
+		chain: &mock.ChainService{
+			State: s,
+		},
+		initialSync:   &mockSync.Sync{IsSyncing: false},
+		seenExitCache: c,
+	}
+
+	buf := new(bytes.Buffer)
+	_, err = p.Encoding().EncodeGossip(buf, exit)
+	require.NoError(t, err)
+	m := &pubsub.Message{
+		Message: &pubsubpb.Message{
+			Data: buf.Bytes(),
+			TopicIDs: []string{
+				p2p.GossipTypeMapping[reflect.TypeOf(exit)],
+			},
+		},
+	}
+	valid := r.validateVoluntaryExit(ctx, "", m) == pubsub.ValidationAccept
+	assert.Equal(t, false, valid, "passed validation")
 }
 
 func TestValidateVoluntaryExit_ValidExit_Syncing(t *testing.T) {

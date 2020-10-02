@@ -29,13 +29,14 @@ type Validator interface {
 	LogValidatorGainsAndLosses(ctx context.Context, slot uint64) error
 	UpdateDuties(ctx context.Context, slot uint64) error
 	UpdateProtections(ctx context.Context, slot uint64) error
-	RolesAt(ctx context.Context, slot uint64) (map[[48]byte][]validatorRole, error) // validator pubKey -> roles
+	RolesAt(ctx context.Context, slot uint64) (map[[48]byte][]ValidatorRole, error) // validator pubKey -> roles
 	SubmitAttestation(ctx context.Context, slot uint64, pubKey [48]byte)
 	ProposeBlock(ctx context.Context, slot uint64, pubKey [48]byte)
 	SubmitAggregateAndProof(ctx context.Context, slot uint64, pubKey [48]byte)
 	LogAttestationsSubmitted()
 	SaveProtections(ctx context.Context) error
 	UpdateDomainDataCaches(ctx context.Context, slot uint64)
+	WaitForWalletInitialization(ctx context.Context) error
 }
 
 // Run the main validator routine. This routine exits if the context is
@@ -50,6 +51,9 @@ type Validator interface {
 // 6 - Perform assigned role, if any
 func run(ctx context.Context, v Validator) {
 	defer v.Done()
+	if err := v.WaitForWalletInitialization(ctx); err != nil {
+		log.Fatalf("Wallet is not ready: %v", err)
+	}
 	if featureconfig.Get().SlasherProtection {
 		if err := v.SlasherReady(ctx); err != nil {
 			log.Fatalf("Slasher is not ready: %v", err)
@@ -83,6 +87,7 @@ func run(ctx context.Context, v Validator) {
 		select {
 		case <-ctx.Done():
 			log.Info("Context canceled, stopping validator")
+			span.End()
 			return // Exit if context is canceled.
 		case slot := <-v.NextSlot():
 			span.AddAttributes(trace.Int64Attribute("slot", int64(slot)))
@@ -107,6 +112,7 @@ func run(ctx context.Context, v Validator) {
 			if featureconfig.Get().LocalProtection {
 				if err := v.UpdateProtections(ctx, slot); err != nil {
 					log.WithError(err).Error("Could not update validator protection")
+					span.End()
 					continue
 				}
 			}
@@ -121,12 +127,13 @@ func run(ctx context.Context, v Validator) {
 			allRoles, err := v.RolesAt(ctx, slot)
 			if err != nil {
 				log.WithError(err).Error("Could not get validator roles")
+				span.End()
 				continue
 			}
 			for pubKey, roles := range allRoles {
 				wg.Add(len(roles))
 				for _, role := range roles {
-					go func(role validatorRole, pubKey [48]byte) {
+					go func(role ValidatorRole, pubKey [48]byte) {
 						defer wg.Done()
 						switch role {
 						case roleAttester:

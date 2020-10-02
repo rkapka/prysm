@@ -1,15 +1,12 @@
 package remote
 
 import (
-	"bytes"
 	"context"
 	"errors"
 	"fmt"
 	"io/ioutil"
 	"os"
-	"reflect"
 	"strconv"
-	"strings"
 	"testing"
 
 	"github.com/golang/mock/gomock"
@@ -18,6 +15,7 @@ import (
 	"github.com/prysmaticlabs/prysm/shared/mock"
 	"github.com/prysmaticlabs/prysm/shared/params"
 	"github.com/prysmaticlabs/prysm/shared/testutil"
+	"github.com/prysmaticlabs/prysm/shared/testutil/assert"
 	"github.com/prysmaticlabs/prysm/shared/testutil/require"
 )
 
@@ -77,7 +75,7 @@ oVV7C5jmJh9VRd2tXIXIZMMNOfThfNf2qDQuJ1S2t5KugozFiRsHUg==
 func TestNewRemoteKeymanager(t *testing.T) {
 	tests := []struct {
 		name       string
-		opts       *Config
+		opts       *KeymanagerOpts
 		clientCert string
 		clientKey  string
 		caCert     string
@@ -85,21 +83,21 @@ func TestNewRemoteKeymanager(t *testing.T) {
 	}{
 		{
 			name: "NoCertificates",
-			opts: &Config{
+			opts: &KeymanagerOpts{
 				RemoteCertificate: nil,
 			},
 			err: "certificates are required",
 		},
 		{
 			name: "NoClientCertificate",
-			opts: &Config{
+			opts: &KeymanagerOpts{
 				RemoteCertificate: &CertificateConfig{},
 			},
 			err: "client certificate is required",
 		},
 		{
 			name: "NoClientKey",
-			opts: &Config{
+			opts: &KeymanagerOpts{
 				RemoteCertificate: &CertificateConfig{
 					ClientCertPath: "/foo/client.crt",
 					ClientKeyPath:  "",
@@ -109,7 +107,7 @@ func TestNewRemoteKeymanager(t *testing.T) {
 		},
 		{
 			name: "MissingClientKey",
-			opts: &Config{
+			opts: &KeymanagerOpts{
 				RemoteCertificate: &CertificateConfig{
 					ClientCertPath: "/foo/client.crt",
 					ClientKeyPath:  "/foo/client.key",
@@ -122,7 +120,7 @@ func TestNewRemoteKeymanager(t *testing.T) {
 			name:       "BadClientCert",
 			clientCert: `bad`,
 			clientKey:  validClientKey,
-			opts: &Config{
+			opts: &KeymanagerOpts{
 				RemoteCertificate: &CertificateConfig{},
 			},
 			err: "failed to obtain client's certificate and/or key: tls: failed to find any PEM data in certificate input",
@@ -131,7 +129,7 @@ func TestNewRemoteKeymanager(t *testing.T) {
 			name:       "BadClientKey",
 			clientCert: validClientCert,
 			clientKey:  `bad`,
-			opts: &Config{
+			opts: &KeymanagerOpts{
 				RemoteCertificate: &CertificateConfig{},
 			},
 			err: "failed to obtain client's certificate and/or key: tls: failed to find any PEM data in key input",
@@ -140,7 +138,7 @@ func TestNewRemoteKeymanager(t *testing.T) {
 			name:       "MissingCACert",
 			clientCert: validClientCert,
 			clientKey:  validClientKey,
-			opts: &Config{
+			opts: &KeymanagerOpts{
 				RemoteCertificate: &CertificateConfig{
 					CACertPath: `bad`,
 				},
@@ -173,7 +171,7 @@ func TestNewRemoteKeymanager(t *testing.T) {
 					test.opts.RemoteCertificate.ClientKeyPath = clientKeyPath
 				}
 			}
-			_, err := NewKeymanager(context.Background(), 1, test.opts)
+			_, err := NewKeymanager(context.Background(), &SetupConfig{Opts: test.opts, MaxMessageSize: 1})
 			if test.err == "" {
 				require.NoError(t, err)
 			} else {
@@ -196,12 +194,7 @@ func TestRemoteKeymanager_Sign(t *testing.T) {
 		gomock.Any(), // epoch
 	).Return(nil, errors.New("could not sign"))
 	_, err := k.Sign(context.Background(), nil)
-	if err == nil {
-		t.Fatal("Expected error, received nil")
-	}
-	if !strings.Contains(err.Error(), "could not sign") {
-		t.Errorf("Unexpected error %v", err)
-	}
+	require.ErrorContains(t, "could not sign", err)
 
 	// Expected proper error handling for signing response statuses.
 	m.EXPECT().Sign(
@@ -243,12 +236,8 @@ func TestRemoteKeymanager_Sign(t *testing.T) {
 		Signature: sig.Marshal(),
 	}, nil /*err*/)
 	resp, err := k.Sign(context.Background(), nil)
-	if err != nil {
-		t.Fatal(err)
-	}
-	if !bytes.Equal(sig.Marshal(), resp.Marshal()) {
-		t.Errorf("Expected %#x, received %#x", sig.Marshal(), resp.Marshal())
-	}
+	require.NoError(t, err)
+	assert.DeepEqual(t, sig.Marshal(), resp.Marshal())
 }
 
 func TestRemoteKeymanager_FetchValidatingPublicKeys(t *testing.T) {
@@ -264,12 +253,7 @@ func TestRemoteKeymanager_FetchValidatingPublicKeys(t *testing.T) {
 		gomock.Any(), // epoch
 	).Return(nil, errors.New("could not fetch keys"))
 	_, err := k.FetchValidatingPublicKeys(context.Background())
-	if err == nil {
-		t.Fatal("Expected error, received nil")
-	}
-	if !strings.Contains(err.Error(), "could not fetch keys") {
-		t.Errorf("Unexpected error %v", err)
-	}
+	require.ErrorContains(t, "could not fetch keys", err)
 
 	// Expect an empty response to return empty keys.
 	m.EXPECT().ListValidatingPublicKeys(
@@ -279,12 +263,8 @@ func TestRemoteKeymanager_FetchValidatingPublicKeys(t *testing.T) {
 		ValidatingPublicKeys: make([][]byte, 0),
 	}, nil /*err*/)
 	keys, err := k.FetchValidatingPublicKeys(context.Background())
-	if err != nil {
-		t.Fatal(err)
-	}
-	if len(keys) != 0 {
-		t.Errorf("Expected empty response, received %v", keys)
-	}
+	require.NoError(t, err)
+	assert.Equal(t, 0, len(keys), "Expected empty response")
 
 	numKeys := 10
 	pubKeys := make([][]byte, numKeys)
@@ -300,14 +280,10 @@ func TestRemoteKeymanager_FetchValidatingPublicKeys(t *testing.T) {
 		ValidatingPublicKeys: pubKeys,
 	}, nil /*err*/)
 	keys, err = k.FetchValidatingPublicKeys(context.Background())
-	if err != nil {
-		t.Fatal(err)
-	}
+	require.NoError(t, err)
 	rawKeys := make([][]byte, len(keys))
 	for i := 0; i < len(rawKeys); i++ {
 		rawKeys[i] = keys[i][:]
 	}
-	if !reflect.DeepEqual(pubKeys, rawKeys) {
-		t.Errorf("Wanted %v, received %v", pubKeys, rawKeys)
-	}
+	assert.DeepEqual(t, pubKeys, rawKeys)
 }

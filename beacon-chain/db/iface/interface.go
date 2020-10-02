@@ -25,6 +25,7 @@ type ReadOnlyDatabase interface {
 	HasBlock(ctx context.Context, blockRoot [32]byte) bool
 	GenesisBlock(ctx context.Context) (*ethpb.SignedBeaconBlock, error)
 	IsFinalizedBlock(ctx context.Context, blockRoot [32]byte) bool
+	FinalizedChildBlock(ctx context.Context, blockRoot [32]byte) (*ethpb.SignedBeaconBlock, error)
 	HighestSlotBlocksBelow(ctx context.Context, slot uint64) ([]*ethpb.SignedBeaconBlock, error)
 	// State related methods.
 	State(ctx context.Context, blockRoot [32]byte) (*state.BeaconState, error)
@@ -107,7 +108,4 @@ type Database interface {
 
 	// Backup and restore methods
 	Backup(ctx context.Context) error
-
-	// HistoricalStatesDeleted verifies historical states exist in DB.
-	HistoricalStatesDeleted(ctx context.Context) error
 }

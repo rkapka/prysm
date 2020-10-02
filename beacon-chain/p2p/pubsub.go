@@ -2,11 +2,11 @@ package p2p
 
 import (
 	"context"
-	"encoding/base64"
 	"time"
 
 	pubsub "github.com/libp2p/go-libp2p-pubsub"
 	pubsub_pb "github.com/libp2p/go-libp2p-pubsub/pb"
+	"github.com/prysmaticlabs/prysm/shared/featureconfig"
 	"github.com/prysmaticlabs/prysm/shared/hashutil"
 )
 
@@ -47,7 +47,24 @@ func (s *Service) PublishToTopic(ctx context.Context, topic string, data []byte,
 	if err != nil {
 		return err
 	}
-	return topicHandle.Publish(ctx, data, opts...)
+
+	// If feature flag isn't enabled, don't wait for peers to be present.
+	if !featureconfig.Get().EnableAttBroadcastDiscoveryAttempts {
+		return topicHandle.Publish(ctx, data, opts...)
+	}
+
+	// Wait for at least 1 peer to be available to receive the published message.
+	for {
+		if len(topicHandle.ListPeers()) > 0 {
+			return topicHandle.Publish(ctx, data, opts...)
+		}
+		select {
+		case <-ctx.Done():
+			return ctx.Err()
+		default:
+			time.Sleep(100 * time.Millisecond)
+		}
+	}
 }
 
 // SubscribeToTopic joins (if necessary) and subscribes to PubSub topic.
@@ -62,10 +79,10 @@ func (s *Service) SubscribeToTopic(topic string, opts ...pubsub.SubOpt) (*pubsub
 // Content addressable ID function.
 //
 // ETH2 spec defines the message ID as:
-//    message-id: base64(SHA256(message.data))
+//    message-id: SHA256(message.data)[:8]
 func msgIDFunction(pmsg *pubsub_pb.Message) string {
-	h := hashutil.FastSum256(pmsg.Data)
-	return base64.URLEncoding.EncodeToString(h[:])
+	h := hashutil.Hash(pmsg.Data)
+	return string(h[:8])
 }
 
 func setPubSubParameters() {

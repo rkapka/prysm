@@ -9,7 +9,6 @@ import (
 	"github.com/libp2p/go-libp2p-core/peer"
 	"github.com/pkg/errors"
 	"github.com/prysmaticlabs/prysm/beacon-chain/p2p"
-	"github.com/prysmaticlabs/prysm/beacon-chain/state/stateutil"
 	"github.com/prysmaticlabs/prysm/shared/params"
 )
 
@@ -39,17 +38,16 @@ func (s *Service) sendRecentBeaconBlocksRequest(ctx context.Context, blockRoots 
 			break
 		}
 		if err != nil {
-			log.WithError(err).Error("Unable to retrieve block from stream")
+			log.WithError(err).Debug("Unable to retrieve block from stream")
 			return err
 		}
 
-		blkRoot, err := stateutil.BlockRoot(blk.Block)
+		blkRoot, err := blk.Block.HashTreeRoot()
 		if err != nil {
 			return err
 		}
 		s.pendingQueueLock.Lock()
-		s.slotToPendingBlocks[blk.Block.Slot] = blk
-		s.seenPendingBlocks[blkRoot] = true
+		s.insertBlockToPendingQueue(blk.Block.Slot, blk, blkRoot)
 		s.pendingQueueLock.Unlock()
 
 	}
@@ -60,7 +58,7 @@ func (s *Service) sendRecentBeaconBlocksRequest(ctx context.Context, blockRoots 
 func (s *Service) beaconBlocksRootRPCHandler(ctx context.Context, msg interface{}, stream libp2pcore.Stream) error {
 	defer func() {
 		if err := stream.Close(); err != nil {
-			log.WithError(err).Error("Failed to close stream")
+			log.WithError(err).Debug("Failed to close stream")
 		}
 	}()
 	ctx, cancel := context.WithTimeout(ctx, ttfbTimeout)
@@ -70,31 +68,30 @@ func (s *Service) beaconBlocksRootRPCHandler(ctx context.Context, msg interface{
 
 	blockRoots, ok := msg.([][32]byte)
 	if !ok {
-		return errors.New("message is not type BeaconBlocksByRootRequest")
-	}
-	if len(blockRoots) == 0 {
-		resp, err := s.generateErrorResponse(responseCodeInvalidRequest, "no block roots provided in request")
-		if err != nil {
-			log.WithError(err).Error("Failed to generate a response error")
-		} else {
-			if _, err := stream.Write(resp); err != nil {
-				log.WithError(err).Errorf("Failed to write to stream")
-			}
-		}
-		return errors.New("no block roots provided")
+		return errors.New("message is not type [][32]byte")
 	}
 	if err := s.rateLimiter.validateRequest(stream, uint64(len(blockRoots))); err != nil {
 		return err
+	}
+	if len(blockRoots) == 0 {
+		// Add to rate limiter in the event no
+		// roots are requested.
+		s.rateLimiter.add(stream, 1)
+		resp, err := s.generateErrorResponse(responseCodeInvalidRequest, "no block roots provided in request")
+		if err != nil {
+			log.WithError(err).Debug("Failed to generate a response error")
+		} else if _, err := stream.Write(resp); err != nil {
+			log.WithError(err).Debugf("Failed to write to stream")
+		}
+		return errors.New("no block roots provided")
 	}
 
 	if uint64(len(blockRoots)) > params.BeaconNetworkConfig().MaxRequestBlocks {
 		resp, err := s.generateErrorResponse(responseCodeInvalidRequest, "requested more than the max block limit")
 		if err != nil {
-			log.WithError(err).Error("Failed to generate a response error")
-		} else {
-			if _, err := stream.Write(resp); err != nil {
-				log.WithError(err).Errorf("Failed to write to stream")
-			}
+			log.WithError(err).Debug("Failed to generate a response error")
+		} else if _, err := stream.Write(resp); err != nil {
+			log.WithError(err).Debugf("Failed to write to stream")
 		}
 		return errors.New("requested more than the max block limit")
 	}
@@ -103,14 +100,12 @@ func (s *Service) beaconBlocksRootRPCHandler(ctx context.Context, msg interface{
 	for _, root := range blockRoots {
 		blk, err := s.db.Block(ctx, root)
 		if err != nil {
-			log.WithError(err).Error("Failed to fetch block")
+			log.WithError(err).Debug("Failed to fetch block")
 			resp, err := s.generateErrorResponse(responseCodeServerError, genericError)
 			if err != nil {
-				log.WithError(err).Error("Failed to generate a response error")
-			} else {
-				if _, err := stream.Write(resp); err != nil {
-					log.WithError(err).Errorf("Failed to write to stream")
-				}
+				log.WithError(err).Debug("Failed to generate a response error")
+			} else if _, err := stream.Write(resp); err != nil {
+				log.WithError(err).Debugf("Failed to write to stream")
 			}
 			return err
 		}

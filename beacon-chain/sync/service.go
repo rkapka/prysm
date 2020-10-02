@@ -21,19 +21,20 @@ import (
 	statefeed "github.com/prysmaticlabs/prysm/beacon-chain/core/feed/state"
 	"github.com/prysmaticlabs/prysm/beacon-chain/core/helpers"
 	"github.com/prysmaticlabs/prysm/beacon-chain/db"
+	"github.com/prysmaticlabs/prysm/beacon-chain/flags"
 	"github.com/prysmaticlabs/prysm/beacon-chain/operations/attestations"
 	"github.com/prysmaticlabs/prysm/beacon-chain/operations/slashings"
 	"github.com/prysmaticlabs/prysm/beacon-chain/operations/voluntaryexits"
 	"github.com/prysmaticlabs/prysm/beacon-chain/p2p"
 	"github.com/prysmaticlabs/prysm/beacon-chain/state/stategen"
 	"github.com/prysmaticlabs/prysm/shared"
-	"github.com/prysmaticlabs/prysm/shared/roughtime"
 	"github.com/prysmaticlabs/prysm/shared/runutil"
+	"github.com/prysmaticlabs/prysm/shared/timeutils"
 )
 
 var _ = shared.Service(&Service{})
 
-const rangeLimit = 1000
+const rangeLimit = 1024
 const seenBlockSize = 1000
 const seenAttSize = 10000
 const seenExitSize = 100
@@ -82,7 +83,7 @@ type Service struct {
 	exitPool                  *voluntaryexits.Pool
 	slashingPool              *slashings.Pool
 	chain                     blockchainService
-	slotToPendingBlocks       map[uint64]*ethpb.SignedBeaconBlock
+	slotToPendingBlocks       map[uint64][]*ethpb.SignedBeaconBlock
 	seenPendingBlocks         map[[32]byte]bool
 	blkRootToPendingAtts      map[[32]byte][]*ethpb.SignedAggregateAttestationAndProof
 	pendingAttsLock           sync.RWMutex
@@ -110,10 +111,10 @@ type Service struct {
 	stateGen                  *stategen.State
 }
 
-// NewRegularSync service.
-func NewRegularSync(cfg *Config) *Service {
+// NewService initializes new regular sync service.
+func NewService(ctx context.Context, cfg *Config) *Service {
 	rLimiter := newRateLimiter(cfg.P2P)
-	ctx, cancel := context.WithCancel(context.Background())
+	ctx, cancel := context.WithCancel(ctx)
 	r := &Service{
 		ctx:                  ctx,
 		cancel:               cancel,
@@ -125,7 +126,7 @@ func NewRegularSync(cfg *Config) *Service {
 		chain:                cfg.Chain,
 		initialSync:          cfg.InitialSync,
 		attestationNotifier:  cfg.AttestationNotifier,
-		slotToPendingBlocks:  make(map[uint64]*ethpb.SignedBeaconBlock),
+		slotToPendingBlocks:  make(map[uint64][]*ethpb.SignedBeaconBlock),
 		seenPendingBlocks:    make(map[[32]byte]bool),
 		blkRootToPendingAtts: make(map[[32]byte][]*ethpb.SignedAggregateAttestationAndProof),
 		stateNotifier:        cfg.StateNotifier,
@@ -155,7 +156,9 @@ func (s *Service) Start() {
 	s.processPendingBlocksQueue()
 	s.processPendingAttsQueue()
 	s.maintainPeerStatuses()
-	s.resyncIfBehind()
+	if !flags.Get().DisableSync {
+		s.resyncIfBehind()
+	}
 
 	// Update sync metrics.
 	runutil.RunEvery(s.ctx, syncMetricsInterval, s.updateMetrics)
@@ -166,7 +169,6 @@ func (s *Service) Stop() error {
 	defer func() {
 		if s.rateLimiter != nil {
 			s.rateLimiter.free()
-			s.rateLimiter = nil
 		}
 	}()
 	defer s.cancel()
@@ -175,16 +177,17 @@ func (s *Service) Stop() error {
 
 // Status of the currently running regular sync service.
 func (s *Service) Status() error {
-	if s.chainStarted {
-		if s.initialSync.Syncing() {
-			return errors.New("waiting for initial sync")
-		}
-		// If our head slot is on a previous epoch and our peers are reporting their head block are
-		// in the most recent epoch, then we might be out of sync.
-		if headEpoch := helpers.SlotToEpoch(s.chain.HeadSlot()); headEpoch+1 < helpers.SlotToEpoch(s.chain.CurrentSlot()) &&
-			headEpoch+1 < s.p2p.Peers().HighestEpoch() {
-			return errors.New("out of sync")
-		}
+	if !s.chainStarted {
+		return errors.New("chain not yet started")
+	}
+	if s.initialSync.Syncing() {
+		return errors.New("waiting for initial sync")
+	}
+	// If our head slot is on a previous epoch and our peers are reporting their head block are
+	// in the most recent epoch, then we might be out of sync.
+	if headEpoch := helpers.SlotToEpoch(s.chain.HeadSlot()); headEpoch+1 < helpers.SlotToEpoch(s.chain.CurrentSlot()) &&
+		headEpoch+1 < s.p2p.Peers().HighestEpoch() {
+		return errors.New("out of sync")
 	}
 	return nil
 }
@@ -231,7 +234,7 @@ func (s *Service) registerHandlers() {
 	stateChannel := make(chan *feed.Event, 1)
 	stateSub := s.stateNotifier.StateFeed().Subscribe(stateChannel)
 	defer stateSub.Unsubscribe()
-	for s.chainStarted == false {
+	for !s.chainStarted {
 		select {
 		case event := <-stateChannel:
 			if event.Type == statefeed.Initialized {
@@ -246,10 +249,11 @@ func (s *Service) registerHandlers() {
 				s.registerRPCHandlers()
 				s.registerSubscribers()
 
-				if data.StartTime.After(roughtime.Now()) {
+				if data.StartTime.After(timeutils.Now()) {
 					stateSub.Unsubscribe()
-					time.Sleep(roughtime.Until(data.StartTime))
+					time.Sleep(timeutils.Until(data.StartTime))
 				}
+				log.WithField("starttime", data.StartTime).Debug("Chain started in sync service")
 				s.chainStarted = true
 			}
 		case <-s.ctx.Done():

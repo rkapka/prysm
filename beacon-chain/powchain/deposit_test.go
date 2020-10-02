@@ -6,10 +6,10 @@ import (
 	"testing"
 
 	ethpb "github.com/prysmaticlabs/ethereumapis/eth/v1alpha1"
-	"github.com/prysmaticlabs/go-ssz"
 	"github.com/prysmaticlabs/prysm/beacon-chain/core/helpers"
 	testDB "github.com/prysmaticlabs/prysm/beacon-chain/db/testing"
 	"github.com/prysmaticlabs/prysm/shared/bls"
+	"github.com/prysmaticlabs/prysm/shared/bytesutil"
 	"github.com/prysmaticlabs/prysm/shared/params"
 	"github.com/prysmaticlabs/prysm/shared/testutil"
 	"github.com/prysmaticlabs/prysm/shared/testutil/assert"
@@ -36,7 +36,7 @@ func TestProcessDeposit_OK(t *testing.T) {
 	eth1Data, err := testutil.DeterministicEth1Data(len(deposits))
 	require.NoError(t, err)
 
-	err = web3Service.processDeposit(eth1Data, deposits[0])
+	err = web3Service.processDeposit(context.Background(), eth1Data, deposits[0])
 	require.NoError(t, err, "could not process deposit")
 
 	valcount, err := helpers.ActiveValidatorCount(web3Service.preGenesisState, 0)
@@ -61,7 +61,7 @@ func TestProcessDeposit_InvalidMerkleBranch(t *testing.T) {
 
 	deposits[0].Proof = [][]byte{{'f', 'a', 'k', 'e'}}
 
-	err = web3Service.processDeposit(eth1Data, deposits[0])
+	err = web3Service.processDeposit(context.Background(), eth1Data, deposits[0])
 	require.NotNil(t, err, "No errors, when an error was expected")
 
 	want := "deposit merkle branch of deposit root did not verify for root"
@@ -81,9 +81,9 @@ func TestProcessDeposit_InvalidPublicKey(t *testing.T) {
 
 	deposits, _, err := testutil.DeterministicDepositsAndKeys(1)
 	require.NoError(t, err)
-	deposits[0].Data.PublicKey = []byte("junk")
+	deposits[0].Data.PublicKey = bytesutil.PadTo([]byte("junk"), 48)
 
-	leaf, err := ssz.HashTreeRoot(deposits[0].Data)
+	leaf, err := deposits[0].Data.HashTreeRoot()
 	require.NoError(t, err, "Could not hash deposit")
 
 	trie, err := trieutil.GenerateTrieFromItems([][]byte{leaf[:]}, int(params.BeaconConfig().DepositContractTreeDepth))
@@ -99,10 +99,10 @@ func TestProcessDeposit_InvalidPublicKey(t *testing.T) {
 		DepositRoot:  root[:],
 	}
 
-	err = web3Service.processDeposit(eth1Data, deposits[0])
+	err = web3Service.processDeposit(context.Background(), eth1Data, deposits[0])
 	require.NoError(t, err)
 
-	testutil.AssertLogsContain(t, hook, pubKeyErr)
+	require.LogsContain(t, hook, pubKeyErr)
 }
 
 func TestProcessDeposit_InvalidSignature(t *testing.T) {
@@ -121,7 +121,7 @@ func TestProcessDeposit_InvalidSignature(t *testing.T) {
 	copy(fakeSig[:], []byte{'F', 'A', 'K', 'E'})
 	deposits[0].Data.Signature = fakeSig[:]
 
-	leaf, err := ssz.HashTreeRoot(deposits[0].Data)
+	leaf, err := deposits[0].Data.HashTreeRoot()
 	require.NoError(t, err, "Could not hash deposit")
 
 	trie, err := trieutil.GenerateTrieFromItems([][]byte{leaf[:]}, int(params.BeaconConfig().DepositContractTreeDepth))
@@ -134,10 +134,10 @@ func TestProcessDeposit_InvalidSignature(t *testing.T) {
 		DepositRoot:  root[:],
 	}
 
-	err = web3Service.processDeposit(eth1Data, deposits[0])
+	err = web3Service.processDeposit(context.Background(), eth1Data, deposits[0])
 	require.NoError(t, err)
 
-	testutil.AssertLogsContain(t, hook, pubKeyErr)
+	require.LogsContain(t, hook, pubKeyErr)
 }
 
 func TestProcessDeposit_UnableToVerify(t *testing.T) {
@@ -154,7 +154,7 @@ func TestProcessDeposit_UnableToVerify(t *testing.T) {
 	deposits, keys, err := testutil.DeterministicDepositsAndKeys(1)
 	require.NoError(t, err)
 	sig := keys[0].Sign([]byte{'F', 'A', 'K', 'E'})
-	deposits[0].Data.Signature = sig.Marshal()[:]
+	deposits[0].Data.Signature = sig.Marshal()
 
 	trie, _, err := testutil.DepositTrieFromDeposits(deposits)
 	require.NoError(t, err)
@@ -166,11 +166,11 @@ func TestProcessDeposit_UnableToVerify(t *testing.T) {
 	proof, err := trie.MerkleProof(0)
 	require.NoError(t, err)
 	deposits[0].Proof = proof
-	err = web3Service.processDeposit(eth1Data, deposits[0])
+	err = web3Service.processDeposit(context.Background(), eth1Data, deposits[0])
 	require.NoError(t, err)
 	want := "signature did not verify"
 
-	testutil.AssertLogsContain(t, hook, want)
+	require.LogsContain(t, hook, want)
 
 }
 
@@ -186,7 +186,8 @@ func TestProcessDeposit_IncompleteDeposit(t *testing.T) {
 	deposit := &ethpb.Deposit{
 		Data: &ethpb.Deposit_Data{
 			Amount:                params.BeaconConfig().EffectiveBalanceIncrement, // incomplete deposit
-			WithdrawalCredentials: []byte("testing"),
+			WithdrawalCredentials: bytesutil.PadTo([]byte("testing"), 32),
+			Signature:             bytesutil.PadTo([]byte("test"), 96),
 		},
 	}
 
@@ -209,7 +210,7 @@ func TestProcessDeposit_IncompleteDeposit(t *testing.T) {
 	}
 	proof, err := trie.MerkleProof(0)
 	require.NoError(t, err)
-	dataRoot, err := ssz.HashTreeRoot(deposit.Data)
+	dataRoot, err := deposit.Data.HashTreeRoot()
 	require.NoError(t, err)
 	deposit.Proof = proof
 
@@ -224,7 +225,7 @@ func TestProcessDeposit_IncompleteDeposit(t *testing.T) {
 
 		deposit.Proof, err = trie.MerkleProof(i)
 		require.NoError(t, err)
-		err = web3Service.processDeposit(eth1Data, deposit)
+		err = web3Service.processDeposit(context.Background(), eth1Data, deposit)
 		require.NoError(t, err, fmt.Sprintf("Could not process deposit at %d", i))
 
 		valcount, err := helpers.ActiveValidatorCount(web3Service.preGenesisState, 0)
@@ -250,7 +251,7 @@ func TestProcessDeposit_AllDepositedSuccessfully(t *testing.T) {
 
 	for i := range keys {
 		eth1Data.DepositCount = uint64(i + 1)
-		err = web3Service.processDeposit(eth1Data, deposits[i])
+		err = web3Service.processDeposit(context.Background(), eth1Data, deposits[i])
 		require.NoError(t, err, fmt.Sprintf("Could not process deposit at %d", i))
 
 		valCount, err := helpers.ActiveValidatorCount(web3Service.preGenesisState, 0)

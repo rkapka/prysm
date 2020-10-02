@@ -20,6 +20,8 @@ The process for implementing new features using this package is as follows:
 package featureconfig
 
 import (
+	"sync"
+
 	"github.com/prysmaticlabs/prysm/shared/cmd"
 	"github.com/prysmaticlabs/prysm/shared/params"
 	"github.com/sirupsen/logrus"
@@ -33,13 +35,17 @@ type Flags struct {
 	// State locks
 	NewBeaconStateLocks bool // NewStateLocks for updated beacon state locking.
 	// Testnet Flags.
-	AltonaTestnet bool // AltonaTestnet defines the flag through which we can enable the node to run on the altona testnet.
-	OnyxTestnet   bool // OnyxTestnet defines the flag through which we can enable the node to run on the onyx testnet.
+	AltonaTestnet  bool // AltonaTestnet defines the flag through which we can enable the node to run on the Altona testnet.
+	OnyxTestnet    bool // OnyxTestnet defines the flag through which we can enable the node to run on the Onyx testnet.
+	SpadinaTestnet bool // SpadinaTestnet defines the flag through which we can enable the node to run on the Spadina testnet.
+	ZinkenTestnet  bool // ZinkenTestnet defines the flag through which we can enable the node to run on the Zinken testnet.
+
 	// Feature related flags.
 	WriteSSZStateTransitions                   bool // WriteSSZStateTransitions to tmp directory.
 	InitSyncNoVerify                           bool // InitSyncNoVerify when initial syncing w/o verifying block's contents.
 	DisableDynamicCommitteeSubnets             bool // Disables dynamic attestation committee subnets via p2p.
 	SkipBLSVerify                              bool // Skips BLS verification across the runtime.
+	EnableBlst                                 bool // Enables new BLS library from supranational.
 	EnableBackupWebhook                        bool // EnableBackupWebhook to allow database backups to trigger from monitoring port /db/backup.
 	PruneEpochBoundaryStates                   bool // PruneEpochBoundaryStates prunes the epoch boundary state before last finalized check point.
 	EnableSnappyDBCompression                  bool // EnableSnappyDBCompression in the database.
@@ -52,7 +58,6 @@ type Flags struct {
 	CheckHeadState                             bool // CheckHeadState checks the current headstate before retrieving the desired state from the db.
 	EnableNoise                                bool // EnableNoise enables the beacon node to use NOISE instead of SECIO when performing a handshake with another peer.
 	DontPruneStateStartUp                      bool // DontPruneStateStartUp disables pruning state upon beacon node start up.
-	NewStateMgmt                               bool // NewStateMgmt enables the new state mgmt service.
 	WaitForSynced                              bool // WaitForSynced uses WaitForSynced in validator startup to ensure it can communicate with the beacon node as soon as possible.
 	ReduceAttesterStateCopy                    bool // ReduceAttesterStateCopy reduces head state copies for attester rpc.
 	EnableAccountsV2                           bool // EnableAccountsV2 for Prysm validator clients.
@@ -60,6 +65,8 @@ type Flags struct {
 	InitSyncVerbose                            bool // InitSyncVerbose logs every processed block during initial syncing.
 	EnableFinalizedDepositsCache               bool // EnableFinalizedDepositsCache enables utilization of cached finalized deposits.
 	EnableEth1DataMajorityVote                 bool // EnableEth1DataMajorityVote uses the Voting With The Majority algorithm to vote for eth1data.
+	EnableAttBroadcastDiscoveryAttempts        bool // EnableAttBroadcastDiscoveryAttempts allows the p2p service to attempt to ensure a subnet peer is present before broadcasting an attestation.
+	EnablePeerScorer                           bool // EnablePeerScorer enables experimental peer scoring in p2p.
 
 	// DisableForkChoice disables using LMD-GHOST fork choice to update
 	// the head of the chain based on attestations and instead accepts any valid received block
@@ -79,15 +86,20 @@ type Flags struct {
 	EnableEth1DataVoteCache bool // EnableEth1DataVoteCache; see https://github.com/prysmaticlabs/prysm/issues/3106.
 	EnableSlasherConnection bool // EnableSlasher enable retrieval of slashing events from a slasher instance.
 	EnableBlockTreeCache    bool // EnableBlockTreeCache enable fork choice service to maintain latest filtered block tree.
+	UseCheckPointInfoCache  bool // UseCheckPointInfoCache uses check point info cache to efficiently verify attestation signatures.
 
 	KafkaBootstrapServers          string // KafkaBootstrapServers to find kafka servers to stream blocks, attestations, etc.
 	AttestationAggregationStrategy string // AttestationAggregationStrategy defines aggregation strategy to be used when aggregating.
 }
 
 var featureConfig *Flags
+var featureConfigLock sync.RWMutex
 
 // Get retrieves feature config.
 func Get() *Flags {
+	featureConfigLock.RLock()
+	defer featureConfigLock.RUnlock()
+
 	if featureConfig == nil {
 		return &Flags{}
 	}
@@ -96,6 +108,9 @@ func Get() *Flags {
 
 // Init sets the global config equal to the config that is passed in.
 func Init(c *Flags) {
+	featureConfigLock.Lock()
+	defer featureConfigLock.Unlock()
+
 	featureConfig = c
 }
 
@@ -131,6 +146,18 @@ func ConfigureBeaconChain(ctx *cli.Context) {
 		params.UseOnyxNetworkConfig()
 		cfg.OnyxTestnet = true
 	}
+	if ctx.Bool(SpadinaTestnet.Name) {
+		log.Warn("Running Node on Spadina Testnet")
+		params.UseSpadinaConfig()
+		params.UseSpadinaNetworkConfig()
+		cfg.SpadinaTestnet = true
+	}
+	if ctx.Bool(ZinkenTestnet.Name) {
+		log.Warn("Running Node on Zinken Testnet")
+		params.UseZinkenConfig()
+		params.UseZinkenNetworkConfig()
+		cfg.ZinkenTestnet = true
+	}
 	if ctx.Bool(writeSSZStateTransitionsFlag.Name) {
 		log.Warn("Writing SSZ states and blocks after state transitions")
 		cfg.WriteSSZStateTransitions = true
@@ -165,10 +192,6 @@ func ConfigureBeaconChain(ctx *cli.Context) {
 		log.Warn("Enabling experimental kafka streaming.")
 		cfg.KafkaBootstrapServers = ctx.String(kafkaBootstrapServersFlag.Name)
 	}
-	if ctx.Bool(enableSlasherFlag.Name) {
-		log.Warn("Enable slasher connection.")
-		cfg.EnableSlasherConnection = true
-	}
 	if ctx.Bool(cacheFilteredBlockTreeFlag.Name) {
 		log.Warn("Enabled filtered block tree cache for fork choice.")
 		cfg.EnableBlockTreeCache = true
@@ -198,11 +221,6 @@ func ConfigureBeaconChain(ctx *cli.Context) {
 		log.Warn("Not enabling state pruning upon start up")
 		cfg.DontPruneStateStartUp = true
 	}
-	cfg.NewStateMgmt = true
-	if ctx.Bool(disableNewStateMgmt.Name) {
-		log.Warn("Disabling new state management service")
-		cfg.NewStateMgmt = false
-	}
 	if ctx.Bool(disableBroadcastSlashingFlag.Name) {
 		log.Warn("Disabling slashing broadcasting to p2p network")
 		cfg.DisableBroadcastSlashings = true
@@ -228,29 +246,45 @@ func ConfigureBeaconChain(ctx *cli.Context) {
 		cfg.DisableGRPCConnectionLogs = true
 	}
 	cfg.AttestationAggregationStrategy = ctx.String(attestationAggregationStrategy.Name)
-	if ctx.Bool(newBeaconStateLocks.Name) {
-		log.Warn("Using new beacon state locks")
-		cfg.NewBeaconStateLocks = true
+	log.Infof("Using %q strategy on attestation aggregation", cfg.AttestationAggregationStrategy)
+
+	cfg.NewBeaconStateLocks = true
+	if ctx.Bool(disableNewBeaconStateLocks.Name) {
+		log.Warn("Disabling new beacon state locks")
+		cfg.NewBeaconStateLocks = false
 	}
-	if ctx.Bool(forceMaxCoverAttestationAggregation.Name) {
-		log.Warn("Forcing max_cover strategy on attestation aggregation")
-		cfg.AttestationAggregationStrategy = "max_cover"
-	}
-	if ctx.Bool(batchBlockVerify.Name) {
-		log.Warn("Performing batch block verification when syncing.")
-		cfg.BatchBlockVerify = true
+	cfg.BatchBlockVerify = true
+	if ctx.Bool(disableBatchBlockVerify.Name) {
+		log.Warn("Disabling batch block verification when syncing.")
+		cfg.BatchBlockVerify = false
 	}
 	if ctx.Bool(initSyncVerbose.Name) {
 		log.Warn("Logging every processed block during initial syncing.")
 		cfg.InitSyncVerbose = true
 	}
-	if ctx.Bool(enableFinalizedDepositsCache.Name) {
-		log.Warn("Enabling finalized deposits cache")
-		cfg.EnableFinalizedDepositsCache = true
+	cfg.EnableFinalizedDepositsCache = true
+	if ctx.Bool(disableFinalizedDepositsCache.Name) {
+		log.Warn("Disabling finalized deposits cache")
+		cfg.EnableFinalizedDepositsCache = false
 	}
 	if ctx.Bool(enableEth1DataMajorityVote.Name) {
 		log.Warn("Enabling eth1data majority vote")
 		cfg.EnableEth1DataMajorityVote = true
+	}
+	if ctx.Bool(enableAttBroadcastDiscoveryAttempts.Name) {
+		cfg.EnableAttBroadcastDiscoveryAttempts = true
+	}
+	if ctx.Bool(enablePeerScorer.Name) {
+		log.Warn("Enabling peer scoring in P2P")
+		cfg.EnablePeerScorer = true
+	}
+	if ctx.Bool(checkPtInfoCache.Name) {
+		log.Warn("Using advance check point info cache")
+		cfg.UseCheckPointInfoCache = true
+	}
+	if ctx.Bool(enableBlst.Name) {
+		log.Warn("Enabling new BLS library blst")
+		cfg.EnableBlst = true
 	}
 	Init(cfg)
 }
@@ -263,6 +297,30 @@ func ConfigureSlasher(ctx *cli.Context) {
 
 	complainOnDeprecatedFlags(ctx)
 	cfg := &Flags{}
+	if ctx.Bool(AltonaTestnet.Name) {
+		log.Warn("Running Validator on Altona Testnet")
+		params.UseAltonaConfig()
+		params.UseAltonaNetworkConfig()
+		cfg.AltonaTestnet = true
+	}
+	if ctx.Bool(OnyxTestnet.Name) {
+		log.Warn("Running Node on Onyx Testnet")
+		params.UseOnyxConfig()
+		params.UseOnyxNetworkConfig()
+		cfg.OnyxTestnet = true
+	}
+	if ctx.Bool(SpadinaTestnet.Name) {
+		log.Warn("Running Node on Spadina Testnet")
+		params.UseSpadinaConfig()
+		params.UseSpadinaNetworkConfig()
+		cfg.SpadinaTestnet = true
+	}
+	if ctx.Bool(ZinkenTestnet.Name) {
+		log.Warn("Running Node on Zinken Testnet")
+		params.UseZinkenConfig()
+		params.UseZinkenNetworkConfig()
+		cfg.ZinkenTestnet = true
+	}
 	if ctx.Bool(disableLookbackFlag.Name) {
 		log.Warn("Disabling slasher lookback")
 		cfg.DisableLookback = true
@@ -290,6 +348,18 @@ func ConfigureValidator(ctx *cli.Context) {
 		params.UseOnyxNetworkConfig()
 		cfg.OnyxTestnet = true
 	}
+	if ctx.Bool(SpadinaTestnet.Name) {
+		log.Warn("Running Node on Spadina Testnet")
+		params.UseSpadinaConfig()
+		params.UseSpadinaNetworkConfig()
+		cfg.SpadinaTestnet = true
+	}
+	if ctx.Bool(ZinkenTestnet.Name) {
+		log.Warn("Running Node on Zinken Testnet")
+		params.UseZinkenConfig()
+		params.UseZinkenNetworkConfig()
+		cfg.ZinkenTestnet = true
+	}
 	if ctx.Bool(enableLocalProtectionFlag.Name) {
 		cfg.LocalProtection = true
 	} else {
@@ -298,6 +368,11 @@ func ConfigureValidator(ctx *cli.Context) {
 	cfg.EnableAccountsV2 = true
 	if ctx.Bool(disableAccountsV2.Name) {
 		log.Warn("Disabling v2 of Prysm validator accounts")
+		log.Error(
+			"Accounts v1 will be fully deprecated in Prysm within the next 2 releases! If you are still " +
+				"using this functionality, please begin to upgrade by creating a v2 wallet. More information can be " +
+				"found in our docs portal https://docs.prylabs.network/docs/wallet/introduction/",
+		)
 		cfg.EnableAccountsV2 = false
 	}
 	if ctx.Bool(enableExternalSlasherProtectionFlag.Name) {

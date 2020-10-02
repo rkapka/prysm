@@ -207,6 +207,11 @@ func (e Exporter) IsFinalizedBlock(ctx context.Context, blockRoot [32]byte) bool
 	return e.db.IsFinalizedBlock(ctx, blockRoot)
 }
 
+// FinalizedChildBlock -- passthrough.
+func (e Exporter) FinalizedChildBlock(ctx context.Context, blockRoot [32]byte) (*ethpb.SignedBeaconBlock, error) {
+	return e.db.FinalizedChildBlock(ctx, blockRoot)
+}
+
 // PowchainData -- passthrough
 func (e Exporter) PowchainData(ctx context.Context) (*db.ETH1ChainData, error) {
 	return e.db.PowchainData(ctx)
@@ -245,11 +250,6 @@ func (e Exporter) HighestSlotStatesBelow(ctx context.Context, slot uint64) ([]*s
 // LastArchivedSlot -- passthrough
 func (e Exporter) LastArchivedSlot(ctx context.Context) (uint64, error) {
 	return e.db.LastArchivedSlot(ctx)
-}
-
-// HistoricalStatesDeleted -- passthrough
-func (e Exporter) HistoricalStatesDeleted(ctx context.Context) error {
-	return e.db.HistoricalStatesDeleted(ctx)
 }
 
 // RunMigrations -- passthrough

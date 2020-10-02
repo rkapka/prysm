@@ -55,6 +55,7 @@ var appHelpFlagGroups = []flagGroup{
 			cmd.TraceSampleFractionFlag,
 			cmd.MonitoringHostFlag,
 			flags.MonitoringPortFlag,
+			cmd.DisableMonitoringFlag,
 			cmd.LogFormat,
 			cmd.LogFileName,
 			cmd.ForceClearDB,
@@ -83,6 +84,7 @@ var appHelpFlagGroups = []flagGroup{
 			flags.RPCHost,
 			flags.BeaconRPCProviderFlag,
 			flags.EnableHistoricalDetectionFlag,
+			flags.SpanCacheSize,
 		},
 	},
 	{

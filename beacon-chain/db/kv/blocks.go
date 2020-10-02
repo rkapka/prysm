@@ -9,7 +9,6 @@ import (
 	ethpb "github.com/prysmaticlabs/ethereumapis/eth/v1alpha1"
 	"github.com/prysmaticlabs/prysm/beacon-chain/core/helpers"
 	"github.com/prysmaticlabs/prysm/beacon-chain/db/filters"
-	"github.com/prysmaticlabs/prysm/beacon-chain/state/stateutil"
 	"github.com/prysmaticlabs/prysm/shared/bytesutil"
 	"github.com/prysmaticlabs/prysm/shared/params"
 	"github.com/prysmaticlabs/prysm/shared/sliceutil"
@@ -181,7 +180,7 @@ func (kv *Store) deleteBlocks(ctx context.Context, blockRoots [][32]byte) error 
 func (kv *Store) SaveBlock(ctx context.Context, signed *ethpb.SignedBeaconBlock) error {
 	ctx, span := trace.StartSpan(ctx, "BeaconDB.SaveBlock")
 	defer span.End()
-	blockRoot, err := stateutil.BlockRoot(signed.Block)
+	blockRoot, err := signed.Block.HashTreeRoot()
 	if err != nil {
 		return err
 	}
@@ -200,7 +199,7 @@ func (kv *Store) SaveBlocks(ctx context.Context, blocks []*ethpb.SignedBeaconBlo
 	return kv.db.Update(func(tx *bolt.Tx) error {
 		bkt := tx.Bucket(blocksBucket)
 		for _, block := range blocks {
-			blockRoot, err := stateutil.BlockRoot(block.Block)
+			blockRoot, err := block.Block.HashTreeRoot()
 			if err != nil {
 				return err
 			}
@@ -334,7 +333,7 @@ func getBlockRootsByFilter(ctx context.Context, tx *bolt.Tx, f *filters.QueryFil
 
 	// We retrieve block roots that match a filter criteria of slot ranges, if specified.
 	filtersMap := f.Filters()
-	rootsBySlotRange := fetchBlockRootsBySlotRange(
+	rootsBySlotRange, err := fetchBlockRootsBySlotRange(
 		ctx,
 		tx.Bucket(blockSlotIndicesBucket),
 		filtersMap[filters.StartSlot],
@@ -343,6 +342,9 @@ func getBlockRootsByFilter(ctx context.Context, tx *bolt.Tx, f *filters.QueryFil
 		filtersMap[filters.EndEpoch],
 		filtersMap[filters.SlotStep],
 	)
+	if err != nil {
+		return nil, err
+	}
 
 	// Once we have a list of block roots that correspond to each
 	// lookup index, we find the intersection across all of them and use
@@ -379,7 +381,7 @@ func fetchBlockRootsBySlotRange(
 	startEpochEncoded interface{},
 	endEpochEncoded interface{},
 	slotStepEncoded interface{},
-) [][]byte {
+) ([][]byte, error) {
 	ctx, span := trace.StartSpan(ctx, "BeaconDB.fetchBlockRootsBySlotRange")
 	defer span.End()
 
@@ -396,9 +398,17 @@ func fetchBlockRootsBySlotRange(
 	}
 	startEpoch, startEpochOk := startEpochEncoded.(uint64)
 	endEpoch, endEpochOk := endEpochEncoded.(uint64)
+	var err error
 	if startEpochOk && endEpochOk {
-		startSlot = helpers.StartSlot(startEpoch)
-		endSlot = helpers.StartSlot(endEpoch) + params.BeaconConfig().SlotsPerEpoch - 1
+		startSlot, err = helpers.StartSlot(startEpoch)
+		if err != nil {
+			return nil, err
+		}
+		endSlot, err = helpers.StartSlot(endEpoch)
+		if err != nil {
+			return nil, err
+		}
+		endSlot = endSlot + params.BeaconConfig().SlotsPerEpoch - 1
 	}
 	min := bytesutil.Uint64ToBytesBigEndian(startSlot)
 	max := bytesutil.Uint64ToBytesBigEndian(endSlot)
@@ -432,7 +442,7 @@ func fetchBlockRootsBySlotRange(
 		}
 		roots = append(roots, splitRoots...)
 	}
-	return roots
+	return roots, nil
 }
 
 // createBlockIndicesFromBlock takes in a beacon block and returns

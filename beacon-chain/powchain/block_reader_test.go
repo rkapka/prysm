@@ -9,6 +9,7 @@ import (
 	"github.com/ethereum/go-ethereum/common"
 	"github.com/ethereum/go-ethereum/common/hexutil"
 	gethTypes "github.com/ethereum/go-ethereum/core/types"
+	"github.com/ethereum/go-ethereum/trie"
 	dbutil "github.com/prysmaticlabs/prysm/beacon-chain/db/testing"
 	mockPOW "github.com/prysmaticlabs/prysm/beacon-chain/powchain/testing"
 	contracts "github.com/prysmaticlabs/prysm/contracts/deposit-contract"
@@ -66,9 +67,9 @@ func TestLatestMainchainInfo_OK(t *testing.T) {
 	assert.Equal(t, hexutil.Encode(web3Service.latestEth1Data.BlockHash), header.Hash().Hex())
 	assert.Equal(t, web3Service.latestEth1Data.BlockTime, header.Time)
 
-	blockInfoExistsInCache, info, err := web3Service.blockCache.BlockInfoByHash(bytesutil.ToBytes32(web3Service.latestEth1Data.BlockHash))
+	headerInfoExistsInCache, info, err := web3Service.headerCache.HeaderInfoByHash(bytesutil.ToBytes32(web3Service.latestEth1Data.BlockHash))
 	require.NoError(t, err)
-	assert.Equal(t, true, blockInfoExistsInCache, "Expected block info to exist in cache")
+	assert.Equal(t, true, headerInfoExistsInCache, "Expected block info to exist in cache")
 	assert.Equal(t, bytesutil.ToBytes32(info.Hash[:]), bytesutil.ToBytes32(web3Service.latestEth1Data.BlockHash))
 
 }
@@ -84,24 +85,36 @@ func TestBlockHashByHeight_ReturnsHash(t *testing.T) {
 	web3Service = setDefaultMocks(web3Service)
 	ctx := context.Background()
 
-	block := gethTypes.NewBlock(
-		&gethTypes.Header{
-			Number: big.NewInt(15),
-			Time:   150,
-		},
-		[]*gethTypes.Transaction{},
-		[]*gethTypes.Header{},
-		[]*gethTypes.Receipt{},
-	)
-	wanted := block.Hash()
+	header := &gethTypes.Header{
+		Number: big.NewInt(15),
+		Time:   150,
+	}
+
+	wanted := header.Hash()
 
 	hash, err := web3Service.BlockHashByHeight(ctx, big.NewInt(0))
 	require.NoError(t, err, "Could not get block hash with given height")
 	require.DeepEqual(t, wanted.Bytes(), hash.Bytes(), "Block hash did not equal expected hash")
 
-	exists, _, err := web3Service.blockCache.BlockInfoByHash(wanted)
+	exists, _, err := web3Service.headerCache.HeaderInfoByHash(wanted)
 	require.NoError(t, err)
 	require.Equal(t, true, exists, "Expected block info to be cached")
+}
+
+func TestBlockHashByHeight_ReturnsError_WhenNoEth1Client(t *testing.T) {
+	beaconDB, _ := dbutil.SetupDB(t)
+	web3Service, err := NewService(context.Background(), &Web3ServiceConfig{
+		HTTPEndPoint: endpoint,
+		BeaconDB:     beaconDB,
+	})
+	require.NoError(t, err, "unable to setup web3 ETH1.0 chain service")
+
+	web3Service = setDefaultMocks(web3Service)
+	web3Service.eth1DataFetcher = nil
+	ctx := context.Background()
+
+	_, err = web3Service.BlockHashByHeight(ctx, big.NewInt(0))
+	require.ErrorContains(t, "nil eth1DataFetcher", err)
 }
 
 func TestBlockExists_ValidHash(t *testing.T) {
@@ -121,6 +134,7 @@ func TestBlockExists_ValidHash(t *testing.T) {
 		[]*gethTypes.Transaction{},
 		[]*gethTypes.Header{},
 		[]*gethTypes.Receipt{},
+		new(trie.Trie),
 	)
 
 	exists, height, err := web3Service.BlockExists(context.Background(), block.Hash())
@@ -128,7 +142,7 @@ func TestBlockExists_ValidHash(t *testing.T) {
 	require.Equal(t, true, exists)
 	require.Equal(t, 0, height.Cmp(block.Number()))
 
-	exists, _, err = web3Service.blockCache.BlockInfoByHeight(height)
+	exists, _, err = web3Service.headerCache.HeaderInfoByHeight(height)
 	require.NoError(t, err)
 	require.Equal(t, true, exists, "Expected block to be cached")
 
@@ -158,37 +172,124 @@ func TestBlockExists_UsesCachedBlockInfo(t *testing.T) {
 	// nil eth1DataFetcher would panic if cached value not used
 	web3Service.eth1DataFetcher = nil
 
-	block := gethTypes.NewBlock(
-		&gethTypes.Header{
-			Number: big.NewInt(0),
-		},
-		[]*gethTypes.Transaction{},
-		[]*gethTypes.Header{},
-		[]*gethTypes.Receipt{},
-	)
+	header := &gethTypes.Header{
+		Number: big.NewInt(0),
+	}
 
-	err = web3Service.blockCache.AddBlock(block)
+	err = web3Service.headerCache.AddHeader(header)
 	require.NoError(t, err)
 
-	exists, height, err := web3Service.BlockExists(context.Background(), block.Hash())
+	exists, height, err := web3Service.BlockExists(context.Background(), header.Hash())
 	require.NoError(t, err, "Could not get block hash with given height")
 	require.Equal(t, true, exists)
-	require.Equal(t, 0, height.Cmp(block.Number()))
+	require.Equal(t, 0, height.Cmp(header.Number))
 }
 
-func TestBlockNumberByTimestamp(t *testing.T) {
+func TestService_BlockNumberByTimestamp(t *testing.T) {
 	beaconDB, _ := dbutil.SetupDB(t)
+	testAcc, err := contracts.Setup()
+	require.NoError(t, err, "Unable to set up simulated backend")
 	web3Service, err := NewService(context.Background(), &Web3ServiceConfig{
 		HTTPEndPoint: endpoint,
 		BeaconDB:     beaconDB,
 	})
 	require.NoError(t, err)
 	web3Service = setDefaultMocks(web3Service)
+	web3Service.eth1DataFetcher = &goodFetcher{backend: testAcc.Backend}
 
+	for i := 0; i < 200; i++ {
+		testAcc.Backend.Commit()
+	}
 	ctx := context.Background()
-	bn, err := web3Service.BlockNumberByTimestamp(ctx, 150000 /* time */)
+	hd, err := testAcc.Backend.HeaderByNumber(ctx, nil)
+	require.NoError(t, err)
+	web3Service.latestEth1Data.BlockTime = hd.Time
+	web3Service.latestEth1Data.BlockHeight = hd.Number.Uint64()
+	bn, err := web3Service.BlockNumberByTimestamp(ctx, 1000 /* time */)
 	require.NoError(t, err)
 	if bn.Cmp(big.NewInt(0)) == 0 {
 		t.Error("Returned a block with zero number, expected to be non zero")
 	}
+}
+
+func TestService_BlockNumberByTimestampLessTargetTime(t *testing.T) {
+	beaconDB, _ := dbutil.SetupDB(t)
+	testAcc, err := contracts.Setup()
+	require.NoError(t, err, "Unable to set up simulated backend")
+	web3Service, err := NewService(context.Background(), &Web3ServiceConfig{
+		HTTPEndPoint: endpoint,
+		BeaconDB:     beaconDB,
+	})
+	require.NoError(t, err)
+	web3Service = setDefaultMocks(web3Service)
+	web3Service.eth1DataFetcher = &goodFetcher{backend: testAcc.Backend}
+
+	for i := 0; i < 200; i++ {
+		testAcc.Backend.Commit()
+	}
+	ctx := context.Background()
+	hd, err := testAcc.Backend.HeaderByNumber(ctx, nil)
+	require.NoError(t, err)
+	web3Service.latestEth1Data.BlockTime = hd.Time
+	// Use extremely small deadline to illustrate that context deadlines are respected.
+	ctx, cancel := context.WithTimeout(ctx, 100*time.Nanosecond)
+	defer cancel()
+
+	// Provide an unattainable target time
+	_, err = web3Service.findLessTargetEth1Block(ctx, hd.Number, hd.Time/2)
+	require.ErrorContains(t, context.DeadlineExceeded.Error(), err)
+
+	// Provide an attainable target time
+	bn, err := web3Service.findLessTargetEth1Block(context.Background(), hd.Number, hd.Time-5)
+	require.NoError(t, err)
+	require.NotEqual(t, hd.Number.Uint64(), bn.Uint64(), "retrieved block is not less than the head")
+}
+
+func TestService_BlockNumberByTimestampMoreTargetTime(t *testing.T) {
+	beaconDB, _ := dbutil.SetupDB(t)
+	testAcc, err := contracts.Setup()
+	require.NoError(t, err, "Unable to set up simulated backend")
+	web3Service, err := NewService(context.Background(), &Web3ServiceConfig{
+		HTTPEndPoint: endpoint,
+		BeaconDB:     beaconDB,
+	})
+	require.NoError(t, err)
+	web3Service = setDefaultMocks(web3Service)
+	web3Service.eth1DataFetcher = &goodFetcher{backend: testAcc.Backend}
+
+	for i := 0; i < 200; i++ {
+		testAcc.Backend.Commit()
+	}
+	ctx := context.Background()
+	hd, err := testAcc.Backend.HeaderByNumber(ctx, nil)
+	require.NoError(t, err)
+	web3Service.latestEth1Data.BlockTime = hd.Time
+	// Use extremely small deadline to illustrate that context deadlines are respected.
+	ctx, cancel := context.WithTimeout(ctx, 100*time.Nanosecond)
+	defer cancel()
+
+	// Provide an unattainable target time with respect to head
+	_, err = web3Service.findMoreTargetEth1Block(ctx, big.NewInt(0).Div(hd.Number, big.NewInt(2)), hd.Time)
+	require.ErrorContains(t, context.DeadlineExceeded.Error(), err)
+
+	// Provide an attainable target time with respect to head
+	bn, err := web3Service.findMoreTargetEth1Block(context.Background(), big.NewInt(0).Sub(hd.Number, big.NewInt(5)), hd.Time)
+	require.NoError(t, err)
+	require.Equal(t, hd.Number.Uint64(), bn.Uint64(), "retrieved block is not equal to the head")
+}
+
+func TestService_BlockTimeByHeight_ReturnsError_WhenNoEth1Client(t *testing.T) {
+	beaconDB, _ := dbutil.SetupDB(t)
+	web3Service, err := NewService(context.Background(), &Web3ServiceConfig{
+		HTTPEndPoint: endpoint,
+		BeaconDB:     beaconDB,
+	})
+	require.NoError(t, err, "unable to setup web3 ETH1.0 chain service")
+
+	web3Service = setDefaultMocks(web3Service)
+	web3Service.eth1DataFetcher = nil
+	ctx := context.Background()
+
+	_, err = web3Service.BlockTimeByHeight(ctx, big.NewInt(0))
+	require.ErrorContains(t, "nil eth1DataFetcher", err)
 }

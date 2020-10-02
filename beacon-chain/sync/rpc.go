@@ -11,7 +11,7 @@ import (
 	"github.com/libp2p/go-libp2p-core/network"
 	"github.com/prysmaticlabs/prysm/beacon-chain/p2p"
 	"github.com/prysmaticlabs/prysm/shared/params"
-	"github.com/prysmaticlabs/prysm/shared/roughtime"
+	"github.com/prysmaticlabs/prysm/shared/timeutils"
 	"github.com/prysmaticlabs/prysm/shared/traceutil"
 	"go.opencensus.io/trace"
 )
@@ -62,7 +62,7 @@ func (s *Service) registerRPC(baseTopic string, handle rpcHandler) {
 	topic := baseTopic + s.p2p.Encoding().ProtocolSuffix()
 	log := log.WithField("topic", topic)
 	s.p2p.SetStreamHandler(topic, func(stream network.Stream) {
-		ctx, cancel := context.WithTimeout(context.Background(), ttfbTimeout)
+		ctx, cancel := context.WithTimeout(s.ctx, ttfbTimeout)
 		defer cancel()
 		defer func() {
 			if err := helpers.FullClose(stream); err != nil && err.Error() != mux.ErrReset.Error() {
@@ -75,8 +75,8 @@ func (s *Service) registerRPC(baseTopic string, handle rpcHandler) {
 		span.AddAttributes(trace.StringAttribute("peer", stream.Conn().RemotePeer().Pretty()))
 		log := log.WithField("peer", stream.Conn().RemotePeer().Pretty())
 
-		if err := stream.SetReadDeadline(roughtime.Now().Add(ttfbTimeout)); err != nil {
-			log.WithError(err).Error("Could not set stream read deadline")
+		if err := stream.SetReadDeadline(timeutils.Now().Add(ttfbTimeout)); err != nil {
+			log.WithError(err).Debug("Could not set stream read deadline")
 			return
 		}
 
@@ -98,7 +98,7 @@ func (s *Service) registerRPC(baseTopic string, handle rpcHandler) {
 			if err := handle(ctx, base, stream); err != nil {
 				messageFailedProcessingCounter.WithLabelValues(topic).Inc()
 				if err != errWrongForkDigestVersion {
-					log.WithError(err).Warn("Failed to handle p2p RPC")
+					log.WithError(err).Debug("Failed to handle p2p RPC")
 				}
 				traceutil.AnnotateError(span, err)
 			}
@@ -117,28 +117,28 @@ func (s *Service) registerRPC(baseTopic string, handle rpcHandler) {
 					traceutil.AnnotateError(span, err)
 					return
 				}
-				log.WithError(err).Warn("Failed to decode stream message")
+				log.WithError(err).Debug("Failed to decode stream message")
 				traceutil.AnnotateError(span, err)
 				return
 			}
 			if err := handle(ctx, msg.Interface(), stream); err != nil {
 				messageFailedProcessingCounter.WithLabelValues(topic).Inc()
 				if err != errWrongForkDigestVersion {
-					log.WithError(err).Warn("Failed to handle p2p RPC")
+					log.WithError(err).Debug("Failed to handle p2p RPC")
 				}
 				traceutil.AnnotateError(span, err)
 			}
 		} else {
 			msg := reflect.New(t)
 			if err := s.p2p.Encoding().DecodeWithMaxLength(stream, msg.Interface()); err != nil {
-				log.WithError(err).Warn("Failed to decode stream message")
+				log.WithError(err).Debug("Failed to decode stream message")
 				traceutil.AnnotateError(span, err)
 				return
 			}
 			if err := handle(ctx, msg.Elem().Interface(), stream); err != nil {
 				messageFailedProcessingCounter.WithLabelValues(topic).Inc()
 				if err != errWrongForkDigestVersion {
-					log.WithError(err).Warn("Failed to handle p2p RPC")
+					log.WithError(err).Debug("Failed to handle p2p RPC")
 				}
 				traceutil.AnnotateError(span, err)
 			}

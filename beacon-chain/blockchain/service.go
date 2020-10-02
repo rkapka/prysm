@@ -30,7 +30,6 @@ import (
 	"github.com/prysmaticlabs/prysm/beacon-chain/powchain"
 	stateTrie "github.com/prysmaticlabs/prysm/beacon-chain/state"
 	"github.com/prysmaticlabs/prysm/beacon-chain/state/stategen"
-	"github.com/prysmaticlabs/prysm/beacon-chain/state/stateutil"
 	pb "github.com/prysmaticlabs/prysm/proto/beacon/p2p/v1"
 	"github.com/prysmaticlabs/prysm/shared/bytesutil"
 	"github.com/prysmaticlabs/prysm/shared/params"
@@ -63,10 +62,8 @@ type Service struct {
 	finalizedCheckpt          *ethpb.Checkpoint
 	prevFinalizedCheckpt      *ethpb.Checkpoint
 	nextEpochBoundarySlot     uint64
-	voteLock                  sync.RWMutex
 	initSyncState             map[[32]byte]*stateTrie.BeaconState
 	boundaryRoots             [][32]byte
-	initSyncStateLock         sync.RWMutex
 	checkpointState           *cache.CheckpointStateCache
 	checkpointStateLock       sync.Mutex
 	stateGen                  *stategen.State
@@ -77,6 +74,10 @@ type Service struct {
 	recentCanonicalBlocksLock sync.RWMutex
 	justifiedBalances         []uint64
 	justifiedBalancesLock     sync.RWMutex
+	checkPtInfoCache          *checkPtInfoCache
+	wsEpoch                   uint64
+	wsRoot                    []byte
+	wsVerified                bool
 }
 
 // Config options for the service.
@@ -94,6 +95,8 @@ type Config struct {
 	ForkChoiceStore   f.ForkChoicer
 	OpsService        *attestations.Service
 	StateGen          *stategen.State
+	WspBlockRoot      []byte
+	WspEpoch          uint64
 }
 
 // NewService instantiates a new block service instance that will
@@ -121,6 +124,9 @@ func NewService(ctx context.Context, cfg *Config) (*Service, error) {
 		initSyncBlocks:        make(map[[32]byte]*ethpb.SignedBeaconBlock),
 		recentCanonicalBlocks: make(map[[32]byte]bool),
 		justifiedBalances:     make([]uint64, 0),
+		checkPtInfoCache:      newCheckPointInfoCache(),
+		wsEpoch:               cfg.WspEpoch,
+		wsRoot:                cfg.WspBlockRoot,
 	}, nil
 }
 
@@ -140,7 +146,23 @@ func (s *Service) Start() {
 	}
 
 	if beaconState == nil {
-		beaconState, err = s.stateGen.StateByRoot(s.ctx, bytesutil.ToBytes32(cp.Root))
+		r := bytesutil.ToBytes32(cp.Root)
+		// Before the first finalized epoch, in the current epoch,
+		// the finalized root is defined as zero hashes instead of genesis root hash.
+		// We want to use genesis root to retrieve for state.
+		if r == params.BeaconConfig().ZeroHash {
+			genesisBlock, err := s.beaconDB.GenesisBlock(s.ctx)
+			if err != nil {
+				log.Fatalf("Could not fetch finalized cp: %v", err)
+			}
+			if genesisBlock != nil {
+				r, err = genesisBlock.Block.HashTreeRoot()
+				if err != nil {
+					log.Fatalf("Could not tree hash genesis block: %v", err)
+				}
+			}
+		}
+		beaconState, err = s.stateGen.StateByRoot(s.ctx, r)
 		if err != nil {
 			log.Fatalf("Could not fetch beacon state by root: %v", err)
 		}
@@ -184,6 +206,11 @@ func (s *Service) Start() {
 		s.finalizedCheckpt = stateTrie.CopyCheckpoint(finalizedCheckpoint)
 		s.prevFinalizedCheckpt = stateTrie.CopyCheckpoint(finalizedCheckpoint)
 		s.resumeForkChoice(justifiedCheckpoint, finalizedCheckpoint)
+
+		if err := s.VerifyWeakSubjectivityRoot(s.ctx); err != nil {
+			// Exit run time if the node failed to verify weak subjectivity checkpoint.
+			log.Fatalf("Could not verify weak subjectivity checkpoint: %v", err)
+		}
 
 		s.stateNotifier.StateFeed().Send(&feed.Event{
 			Type: statefeed.Initialized,
@@ -260,7 +287,7 @@ func (s *Service) initializeBeaconChain(
 	genesisTime time.Time,
 	preGenesisState *stateTrie.BeaconState,
 	eth1data *ethpb.Eth1Data) (*stateTrie.BeaconState, error) {
-	_, span := trace.StartSpan(context.Background(), "beacon-chain.Service.initializeBeaconChain")
+	ctx, span := trace.StartSpan(ctx, "beacon-chain.Service.initializeBeaconChain")
 	defer span.End()
 	s.genesisTime = genesisTime
 	unixTime := uint64(genesisTime.Unix())
@@ -297,8 +324,16 @@ func (s *Service) Stop() error {
 	defer s.cancel()
 
 	if s.stateGen != nil && s.head != nil && s.head.state != nil {
-		return s.stateGen.ForceCheckpoint(s.ctx, s.head.state.FinalizedCheckpoint().Root)
+		if err := s.stateGen.ForceCheckpoint(s.ctx, s.head.state.FinalizedCheckpoint().Root); err != nil {
+			return err
+		}
 	}
+
+	// Save initial sync cached blocks to the DB before stop.
+	if err := s.beaconDB.SaveBlocks(s.ctx, s.getInitSyncBlocks()); err != nil {
+		return err
+	}
+
 	return nil
 }
 
@@ -324,7 +359,7 @@ func (s *Service) saveGenesisData(ctx context.Context, genesisState *stateTrie.B
 		return err
 	}
 	genesisBlk := blocks.NewGenesisBlock(stateRoot[:])
-	genesisBlkRoot, err := stateutil.BlockRoot(genesisBlk.Block)
+	genesisBlkRoot, err := genesisBlk.Block.HashTreeRoot()
 	if err != nil {
 		return errors.Wrap(err, "could not get genesis block root")
 	}
@@ -388,7 +423,7 @@ func (s *Service) initializeChainInfo(ctx context.Context) error {
 	if genesisBlock == nil {
 		return errors.New("no genesis block in db")
 	}
-	genesisBlkRoot, err := stateutil.BlockRoot(genesisBlock.Block)
+	genesisBlkRoot, err := genesisBlock.Block.HashTreeRoot()
 	if err != nil {
 		return errors.Wrap(err, "could not get signing root of genesis block")
 	}
@@ -399,7 +434,7 @@ func (s *Service) initializeChainInfo(ctx context.Context) error {
 		if err != nil {
 			return errors.Wrap(err, "could not retrieve head block")
 		}
-		headRoot, err := stateutil.BlockRoot(headBlock.Block)
+		headRoot, err := headBlock.Block.HashTreeRoot()
 		if err != nil {
 			return errors.Wrap(err, "could not hash head block")
 		}
@@ -420,16 +455,12 @@ func (s *Service) initializeChainInfo(ctx context.Context) error {
 		// would be the genesis state and block.
 		return errors.New("no finalized epoch in the database")
 	}
-	finalizedRoot := bytesutil.ToBytes32(finalized.Root)
+	finalizedRoot := s.ensureRootNotZeros(bytesutil.ToBytes32(finalized.Root))
 	var finalizedState *stateTrie.BeaconState
 
 	finalizedState, err = s.stateGen.Resume(ctx)
 	if err != nil {
 		return errors.Wrap(err, "could not get finalized state from db")
-	}
-	finalizedRoot = s.beaconDB.LastArchivedRoot(ctx)
-	if finalizedRoot == params.BeaconConfig().ZeroHash {
-		finalizedRoot = bytesutil.ToBytes32(finalized.Root)
 	}
 
 	finalizedBlock, err := s.beaconDB.Block(ctx, finalizedRoot)

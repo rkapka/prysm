@@ -75,13 +75,17 @@ func (l *limiter) validateRequest(stream network.Stream, amt uint64) error {
 	}
 	key := stream.Conn().RemotePeer().String()
 	remaining := collector.Remaining(key)
+	// Treat each request as a minimum of 1.
+	if amt == 0 {
+		amt = 1
+	}
 	if amt > uint64(remaining) {
 		l.p2p.Peers().Scorers().BadResponsesScorer().Increment(stream.Conn().RemotePeer())
 		if l.p2p.Peers().IsBad(stream.Conn().RemotePeer()) {
 			log.Debug("Disconnecting bad peer")
 			defer func() {
 				if err := l.p2p.Disconnect(stream.Conn().RemotePeer()); err != nil {
-					log.WithError(err).Error("Failed to disconnect peer")
+					log.WithError(err).Debug("Failed to disconnect peer")
 				}
 			}()
 		}

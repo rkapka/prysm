@@ -8,6 +8,8 @@ import (
 	"io/ioutil"
 	"strings"
 	"sync"
+
+	v2keymanager "github.com/prysmaticlabs/prysm/validator/keymanager/v2"
 )
 
 // Wallet contains an in-memory, simulated wallet implementation.
@@ -17,8 +19,8 @@ type Wallet struct {
 	Files             map[string]map[string][]byte
 	EncryptedSeedFile []byte
 	AccountPasswords  map[string]string
-	UnlockAccounts    bool
 	WalletPassword    string
+	UnlockAccounts    bool
 	lock              sync.RWMutex
 }
 
@@ -38,34 +40,19 @@ func (m *Wallet) AccountsDir() string {
 	return m.InnerAccountsDir
 }
 
+// Exists --
+func (m *Wallet) Exists() (bool, error) {
+	return len(m.Directories) > 0, nil
+}
+
 // Password --
 func (m *Wallet) Password() string {
 	return m.WalletPassword
 }
 
-// ListDirs --
-func (m *Wallet) ListDirs() ([]string, error) {
-	return m.Directories, nil
-}
-
-// WritePasswordToDisk --
-func (m *Wallet) WritePasswordToDisk(ctx context.Context, passwordFileName string, password string) error {
-	m.lock.Lock()
-	defer m.lock.Unlock()
-	m.AccountPasswords[passwordFileName] = password
-	return nil
-}
-
-// ReadPasswordFromDisk --
-func (m *Wallet) ReadPasswordFromDisk(ctx context.Context, passwordFileName string) (string, error) {
-	m.lock.RLock()
-	defer m.lock.RUnlock()
-	for name, password := range m.AccountPasswords {
-		if name == passwordFileName {
-			return password, nil
-		}
-	}
-	return "", errors.New("account not found")
+// SetPassword sets a new password for the wallet.
+func (m *Wallet) SetPassword(newPass string) {
+	m.WalletPassword = newPass
 }
 
 // WriteFileAtPath --
@@ -104,4 +91,9 @@ func (m *Wallet) WriteEncryptedSeedToDisk(ctx context.Context, encoded []byte) e
 	defer m.lock.Unlock()
 	m.EncryptedSeedFile = encoded
 	return nil
+}
+
+// InitializeKeymanager --
+func (m *Wallet) InitializeKeymanager(ctx context.Context, skipMnemonicConfirm bool) (v2keymanager.IKeymanager, error) {
+	return nil, nil
 }

@@ -12,6 +12,7 @@ import (
 	"github.com/prysmaticlabs/prysm/beacon-chain/cache"
 	stateTrie "github.com/prysmaticlabs/prysm/beacon-chain/state"
 	"github.com/prysmaticlabs/prysm/shared/bytesutil"
+	"github.com/prysmaticlabs/prysm/shared/featureconfig"
 	"github.com/prysmaticlabs/prysm/shared/hashutil"
 	"github.com/prysmaticlabs/prysm/shared/params"
 	"github.com/prysmaticlabs/prysm/shared/sliceutil"
@@ -143,7 +144,30 @@ func ComputeCommittee(
 	// for fast computation of committees.
 	// Reference implementation: https://github.com/protolambda/eth2-shuffle
 	shuffledList, err := UnshuffleList(shuffledIndices, seed)
-	return shuffledList[start:end], err
+	if err != nil {
+		return nil, err
+	}
+
+	// This updates the cache on a miss.
+	if featureconfig.Get().UseCheckPointInfoCache {
+		sortedIndices := make([]uint64, len(indices))
+		copy(sortedIndices, indices)
+		sort.Slice(sortedIndices, func(i, j int) bool {
+			return sortedIndices[i] < sortedIndices[j]
+		})
+
+		count = SlotCommitteeCount(uint64(len(shuffledIndices)))
+		if err := committeeCache.AddCommitteeShuffledList(&cache.Committees{
+			ShuffledIndices: shuffledList,
+			CommitteeCount:  count * params.BeaconConfig().SlotsPerEpoch,
+			Seed:            seed,
+			SortedIndices:   sortedIndices,
+		}); err != nil {
+			return nil, err
+		}
+	}
+
+	return shuffledList[start:end], nil
 }
 
 // CommitteeAssignmentContainer represents a committee, index, and attester slot for a given epoch.
@@ -176,7 +200,10 @@ func CommitteeAssignments(
 	// We determine the slots in which proposers are supposed to act.
 	// Some validators may need to propose multiple times per epoch, so
 	// we use a map of proposer idx -> []slot to keep track of this possibility.
-	startSlot := StartSlot(epoch)
+	startSlot, err := StartSlot(epoch)
+	if err != nil {
+		return nil, nil, err
+	}
 	proposerIndexToSlots := make(map[uint64][]uint64, params.BeaconConfig().SlotsPerEpoch)
 	for slot := startSlot; slot < startSlot+params.BeaconConfig().SlotsPerEpoch; slot++ {
 		// Skip proposer assignment for genesis slot.
@@ -285,7 +312,8 @@ func UpdateCommitteeCache(state *stateTrie.BeaconState, epoch uint64) error {
 		if err != nil {
 			return err
 		}
-		if _, exists, err := committeeCache.CommitteeCache.GetByKey(string(seed[:])); err == nil && exists {
+
+		if committeeCache.HasEntry(string(seed[:])) {
 			return nil
 		}
 
@@ -322,7 +350,7 @@ func UpdateCommitteeCache(state *stateTrie.BeaconState, epoch uint64) error {
 func UpdateProposerIndicesInCache(state *stateTrie.BeaconState, epoch uint64) error {
 	indices, err := ActiveValidatorIndices(state, epoch)
 	if err != nil {
-		return nil
+		return err
 	}
 	proposerIndices, err := precomputeProposerIndices(state, indices)
 	if err != nil {
@@ -356,7 +384,10 @@ func precomputeProposerIndices(state *stateTrie.BeaconState, activeIndices []uin
 	if err != nil {
 		return nil, errors.Wrap(err, "could not generate seed")
 	}
-	slot := StartSlot(e)
+	slot, err := StartSlot(e)
+	if err != nil {
+		return nil, err
+	}
 	for i := uint64(0); i < params.BeaconConfig().SlotsPerEpoch; i++ {
 		seedWithSlot := append(seed[:], bytesutil.Bytes8(slot+i)...)
 		seedWithSlotHash := hashFunc(seedWithSlot)

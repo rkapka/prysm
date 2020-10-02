@@ -4,13 +4,14 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"strings"
 
 	libp2pcore "github.com/libp2p/go-libp2p-core"
 	"github.com/libp2p/go-libp2p-core/helpers"
 	"github.com/libp2p/go-libp2p-core/mux"
 	"github.com/libp2p/go-libp2p-core/peer"
 	"github.com/prysmaticlabs/prysm/beacon-chain/p2p"
-	"github.com/prysmaticlabs/prysm/shared/roughtime"
+	"github.com/prysmaticlabs/prysm/shared/timeutils"
 )
 
 // pingHandler reads the incoming ping rpc message from the peer.
@@ -20,7 +21,7 @@ func (s *Service) pingHandler(ctx context.Context, msg interface{}, stream libp2
 	m, ok := msg.(*uint64)
 	if !ok {
 		if err := stream.Close(); err != nil {
-			log.WithError(err).Error("Failed to close stream")
+			log.WithError(err).Debug("Failed to close stream")
 		}
 		return fmt.Errorf("wrong message type for ping, got %T, wanted *uint64", msg)
 	}
@@ -36,19 +37,19 @@ func (s *Service) pingHandler(ctx context.Context, msg interface{}, stream libp2
 			s.writeErrorResponseToStream(responseCodeInvalidRequest, seqError, stream)
 		}
 		if err := stream.Close(); err != nil {
-			log.WithError(err).Error("Failed to close stream")
+			log.WithError(err).Debug("Failed to close stream")
 		}
 		return err
 	}
 	if _, err := stream.Write([]byte{responseCodeSuccess}); err != nil {
 		if err := stream.Close(); err != nil {
-			log.WithError(err).Error("Failed to close stream")
+			log.WithError(err).Debug("Failed to close stream")
 		}
 		return err
 	}
 	if _, err := s.p2p.Encoding().EncodeWithMaxLength(stream, s.p2p.MetadataSeq()); err != nil {
 		if err := stream.Close(); err != nil {
-			log.WithError(err).Error("Failed to close stream")
+			log.WithError(err).Debug("Failed to close stream")
 		}
 		return err
 	}
@@ -56,7 +57,7 @@ func (s *Service) pingHandler(ctx context.Context, msg interface{}, stream libp2
 	if valid {
 		// If the sequence number was valid we're done.
 		if err := stream.Close(); err != nil {
-			log.WithError(err).Error("Failed to close stream")
+			log.WithError(err).Debug("Failed to close stream")
 		}
 		return nil
 	}
@@ -65,7 +66,7 @@ func (s *Service) pingHandler(ctx context.Context, msg interface{}, stream libp2
 	go func() {
 		defer func() {
 			if err := stream.Close(); err != nil {
-				log.WithError(err).Error("Failed to close stream")
+				log.WithError(err).Debug("Failed to close stream")
 			}
 		}()
 		// New context so the calling function doesn't cancel on us.
@@ -73,7 +74,9 @@ func (s *Service) pingHandler(ctx context.Context, msg interface{}, stream libp2
 		defer cancel()
 		md, err := s.sendMetaDataRequest(ctx, stream.Conn().RemotePeer())
 		if err != nil {
-			log.WithField("peer", stream.Conn().RemotePeer()).WithError(err).Debug("Failed to send metadata request")
+			if !strings.Contains(err.Error(), deadlineError) {
+				log.WithField("peer", stream.Conn().RemotePeer()).WithError(err).Debug("Failed to send metadata request")
+			}
 			return
 		}
 		// update metadata if there is no error
@@ -92,7 +95,7 @@ func (s *Service) sendPingRequest(ctx context.Context, id peer.ID) error {
 	if err != nil {
 		return err
 	}
-	currentTime := roughtime.Now()
+	currentTime := timeutils.Now()
 	defer func() {
 		if err := helpers.FullClose(stream); err != nil && err.Error() != mux.ErrReset.Error() {
 			log.WithError(err).Debugf("Failed to reset stream with protocol %s", stream.Protocol())
@@ -104,7 +107,7 @@ func (s *Service) sendPingRequest(ctx context.Context, id peer.ID) error {
 		return err
 	}
 	// Records the latency of the ping request for that peer.
-	s.p2p.Host().Peerstore().RecordLatency(id, roughtime.Now().Sub(currentTime))
+	s.p2p.Host().Peerstore().RecordLatency(id, timeutils.Now().Sub(currentTime))
 
 	if code != 0 {
 		s.p2p.Peers().Scorers().BadResponsesScorer().Increment(stream.Conn().RemotePeer())

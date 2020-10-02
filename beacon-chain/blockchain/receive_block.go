@@ -40,7 +40,7 @@ func (s *Service) ReceiveBlock(ctx context.Context, block *ethpb.SignedBeaconBlo
 
 	// Update and save head block after fork choice.
 	if err := s.updateHead(ctx, s.getJustifiedBalances()); err != nil {
-		return errors.Wrap(err, "could not update head")
+		log.WithError(err).Warn("Could not update head")
 	}
 
 	// Send notification of the processed block to the state feed.
@@ -140,6 +140,11 @@ func (s *Service) ReceiveBlockBatch(ctx context.Context, blocks []*ethpb.SignedB
 
 		// Reports on blockCopy and fork choice metrics.
 		reportSlotMetrics(blockCopy.Block.Slot, s.headSlot(), s.CurrentSlot(), s.finalizedCheckpt)
+	}
+
+	if err := s.VerifyWeakSubjectivityRoot(s.ctx); err != nil {
+		// Exit run time if the node failed to verify weak subjectivity checkpoint.
+		log.Fatalf("Could not verify weak subjectivity checkpoint: %v", err)
 	}
 
 	return nil

@@ -25,7 +25,8 @@ func ProcessPreGenesisDeposits(
 	deposits []*ethpb.Deposit,
 ) (*stateTrie.BeaconState, error) {
 	var err error
-	beaconState, err = ProcessDeposits(ctx, beaconState, deposits)
+	beaconState, err = ProcessDeposits(ctx, beaconState, &ethpb.SignedBeaconBlock{
+		Block: &ethpb.BeaconBlock{Body: &ethpb.BeaconBlockBody{Deposits: deposits}}})
 	if err != nil {
 		return nil, errors.Wrap(err, "could not process deposit")
 	}
@@ -66,10 +67,14 @@ func ProcessPreGenesisDeposits(
 func ProcessDeposits(
 	ctx context.Context,
 	beaconState *stateTrie.BeaconState,
-	deposits []*ethpb.Deposit,
+	b *ethpb.SignedBeaconBlock,
 ) (*stateTrie.BeaconState, error) {
-	var err error
+	if b.Block == nil || b.Block.Body == nil {
+		return nil, errors.New("block and block body can't be nil")
+	}
 
+	deposits := b.Block.Body.Deposits
+	var err error
 	domain, err := helpers.ComputeDomain(params.BeaconConfig().DomainDeposit, nil, nil)
 	if err != nil {
 		return nil, err
@@ -179,10 +184,8 @@ func ProcessDeposit(beaconState *stateTrie.BeaconState, deposit *ethpb.Deposit, 
 		if err := beaconState.AppendBalance(amount); err != nil {
 			return nil, err
 		}
-	} else {
-		if err := helpers.IncreaseBalance(beaconState, index, amount); err != nil {
-			return nil, err
-		}
+	} else if err := helpers.IncreaseBalance(beaconState, index, amount); err != nil {
+		return nil, err
 	}
 
 	return beaconState, nil
@@ -199,7 +202,7 @@ func verifyDeposit(beaconState *stateTrie.BeaconState, deposit *ethpb.Deposit) e
 	}
 
 	receiptRoot := eth1Data.DepositRoot
-	leaf, err := ssz.HashTreeRoot(deposit.Data)
+	leaf, err := deposit.Data.HashTreeRoot()
 	if err != nil {
 		return errors.Wrap(err, "could not tree hash deposit data")
 	}
@@ -208,12 +211,14 @@ func verifyDeposit(beaconState *stateTrie.BeaconState, deposit *ethpb.Deposit) e
 		leaf[:],
 		int(beaconState.Eth1DepositIndex()),
 		deposit.Proof,
+		params.BeaconConfig().DepositContractTreeDepth,
 	); !ok {
 		return fmt.Errorf(
 			"deposit merkle branch of deposit root did not verify for root: %#x",
 			receiptRoot,
 		)
 	}
+
 	return nil
 }
 
@@ -227,7 +232,7 @@ func verifyDepositDataWithDomain(ctx context.Context, deps []*ethpb.Deposit, dom
 		return nil
 	}
 	pks := make([]bls.PublicKey, len(deps))
-	sigs := make([]bls.Signature, len(deps))
+	sigs := make([][]byte, len(deps))
 	msgs := make([][32]byte, len(deps))
 	for i, dep := range deps {
 		if ctx.Err() != nil {
@@ -236,17 +241,12 @@ func verifyDepositDataWithDomain(ctx context.Context, deps []*ethpb.Deposit, dom
 		if dep == nil || dep.Data == nil {
 			return errors.New("nil deposit")
 		}
-
 		dpk, err := bls.PublicKeyFromBytes(dep.Data.PublicKey)
 		if err != nil {
 			return err
 		}
 		pks[i] = dpk
-		dsig, err := bls.SignatureFromBytes(dep.Data.Signature)
-		if err != nil {
-			return err
-		}
-		sigs[i] = dsig
+		sigs[i] = dep.Data.Signature
 		root, err := ssz.SigningRoot(dep.Data)
 		if err != nil {
 			return errors.Wrap(err, "could not get signing root")
@@ -255,7 +255,7 @@ func verifyDepositDataWithDomain(ctx context.Context, deps []*ethpb.Deposit, dom
 			ObjectRoot: root[:],
 			Domain:     domain,
 		}
-		ctrRoot, err := ssz.HashTreeRoot(signingData)
+		ctrRoot, err := signingData.HashTreeRoot()
 		if err != nil {
 			return errors.Wrap(err, "could not get container root")
 		}

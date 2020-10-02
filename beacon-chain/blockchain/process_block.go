@@ -231,11 +231,11 @@ func (s *Service) onBlockBatch(ctx context.Context, blks []*ethpb.SignedBeaconBl
 	jCheckpoints := make([]*ethpb.Checkpoint, len(blks))
 	fCheckpoints := make([]*ethpb.Checkpoint, len(blks))
 	sigSet := &bls.SignatureSet{
-		Signatures: []bls.Signature{},
+		Signatures: [][]byte{},
 		PublicKeys: []bls.PublicKey{},
 		Messages:   [][32]byte{},
 	}
-	set := new(bls.SignatureSet)
+	var set *bls.SignatureSet
 	boundaries := make(map[[32]byte]*stateTrie.BeaconState)
 	for i, b := range blks {
 		set, preState, err = state.ExecuteStateTransitionNoVerifyAnySig(ctx, preState, b)
@@ -253,7 +253,7 @@ func (s *Service) onBlockBatch(ctx context.Context, blks []*ethpb.SignedBeaconBl
 		fCheckpoints[i] = preState.FinalizedCheckpoint()
 		sigSet.Join(set)
 	}
-	verify, err := bls.VerifyMultipleSignatures(sigSet.Signatures, sigSet.Messages, sigSet.PublicKeys)
+	verify, err := sigSet.Verify()
 	if err != nil {
 		return nil, nil, err
 	}
@@ -316,8 +316,11 @@ func (s *Service) handleBlockAfterBatchVerify(ctx context.Context, signed *ethpb
 func (s *Service) handleEpochBoundary(postState *stateTrie.BeaconState) error {
 	if postState.Slot() >= s.nextEpochBoundarySlot {
 		reportEpochMetrics(postState)
-		s.nextEpochBoundarySlot = helpers.StartSlot(helpers.NextEpoch(postState))
-
+		var err error
+		s.nextEpochBoundarySlot, err = helpers.StartSlot(helpers.NextEpoch(postState))
+		if err != nil {
+			return err
+		}
 		// Update committees cache at epoch boundary slot.
 		if err := helpers.UpdateCommitteeCache(postState, helpers.CurrentEpoch(postState)); err != nil {
 			return err
@@ -372,10 +375,8 @@ func (s *Service) savePostStateInfo(ctx context.Context, r [32]byte, b *ethpb.Si
 	defer span.End()
 	if initSync {
 		s.saveInitSyncBlock(r, b)
-	} else {
-		if err := s.beaconDB.SaveBlock(ctx, b); err != nil {
-			return errors.Wrapf(err, "could not save block from slot %d", b.Block.Slot)
-		}
+	} else if err := s.beaconDB.SaveBlock(ctx, b); err != nil {
+		return errors.Wrapf(err, "could not save block from slot %d", b.Block.Slot)
 	}
 	if err := s.stateGen.SaveState(ctx, r, state); err != nil {
 		return errors.Wrap(err, "could not save state")

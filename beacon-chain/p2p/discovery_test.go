@@ -1,6 +1,7 @@
 package p2p
 
 import (
+	"context"
 	"crypto/ecdsa"
 	"fmt"
 	"math/rand"
@@ -17,6 +18,7 @@ import (
 	mock "github.com/prysmaticlabs/prysm/beacon-chain/blockchain/testing"
 	"github.com/prysmaticlabs/prysm/beacon-chain/core/feed"
 	statefeed "github.com/prysmaticlabs/prysm/beacon-chain/core/feed/state"
+	"github.com/prysmaticlabs/prysm/shared/bytesutil"
 	"github.com/prysmaticlabs/prysm/shared/iputils"
 	"github.com/prysmaticlabs/prysm/shared/testutil"
 	"github.com/prysmaticlabs/prysm/shared/testutil/assert"
@@ -32,9 +34,7 @@ func init() {
 
 func createAddrAndPrivKey(t *testing.T) (net.IP, *ecdsa.PrivateKey) {
 	ip, err := iputils.ExternalIPv4()
-	if err != nil {
-		t.Fatalf("Could not get ip: %v", err)
-	}
+	require.NoError(t, err, "Could not get ip")
 	ipAddr := net.ParseIP(ip)
 	temp := testutil.TempDir()
 	randNum := rand.Int()
@@ -50,7 +50,7 @@ func TestCreateListener(t *testing.T) {
 	ipAddr, pkey := createAddrAndPrivKey(t)
 	s := &Service{
 		genesisTime:           time.Now(),
-		genesisValidatorsRoot: []byte{'A'},
+		genesisValidatorsRoot: bytesutil.PadTo([]byte{'A'}, 32),
 		cfg:                   &Config{UDPPort: uint(port)},
 	}
 	listener, err := s.createListener(ipAddr, pkey)
@@ -125,7 +125,7 @@ func TestMultiAddrsConversion_InvalidIPAddr(t *testing.T) {
 	_, pkey := createAddrAndPrivKey(t)
 	s := &Service{
 		genesisTime:           time.Now(),
-		genesisValidatorsRoot: []byte{'A'},
+		genesisValidatorsRoot: bytesutil.PadTo([]byte{'A'}, 32),
 	}
 	node, err := s.createLocalNode(pkey, addr, 0, 0)
 	require.NoError(t, err)
@@ -142,16 +142,16 @@ func TestMultiAddrConversion_OK(t *testing.T) {
 			UDPPort: 0,
 		},
 		genesisTime:           time.Now(),
-		genesisValidatorsRoot: []byte{'A'},
+		genesisValidatorsRoot: bytesutil.PadTo([]byte{'A'}, 32),
 	}
 	listener, err := s.createListener(ipAddr, pkey)
 	require.NoError(t, err)
 	defer listener.Close()
 
 	_ = convertToMultiAddr([]*enode.Node{listener.Self()})
-	testutil.AssertLogsDoNotContain(t, hook, "Node doesn't have an ip4 address")
-	testutil.AssertLogsDoNotContain(t, hook, "Invalid port, the tcp port of the node is a reserved port")
-	testutil.AssertLogsDoNotContain(t, hook, "Could not get multiaddr")
+	require.LogsDoNotContain(t, hook, "Node doesn't have an ip4 address")
+	require.LogsDoNotContain(t, hook, "Invalid port, the tcp port of the node is a reserved port")
+	require.LogsDoNotContain(t, hook, "Could not get multiaddr")
 }
 
 func TestStaticPeering_PeersAreAdded(t *testing.T) {
@@ -181,7 +181,7 @@ func TestStaticPeering_PeersAreAdded(t *testing.T) {
 	cfg.StaticPeers = staticPeers
 	cfg.StateNotifier = &mock.MockStateNotifier{}
 	cfg.NoDiscovery = true
-	s, err := NewService(cfg)
+	s, err := NewService(context.Background(), cfg)
 	require.NoError(t, err)
 
 	exitRoutine := make(chan bool)
@@ -204,4 +204,25 @@ func TestStaticPeering_PeersAreAdded(t *testing.T) {
 	assert.Equal(t, 5, len(peers), "Not all peers added to peerstore")
 	require.NoError(t, s.Stop())
 	exitRoutine <- true
+}
+
+func TestHostIsResolved(t *testing.T) {
+	// As defined in RFC 2606 , example.org is a
+	// reserved example domain name.
+	exampleHost := "example.org"
+	exampleIP := "93.184.216.34"
+
+	s := &Service{
+		cfg: &Config{
+			HostDNS: exampleHost,
+		},
+		genesisTime:           time.Now(),
+		genesisValidatorsRoot: bytesutil.PadTo([]byte{'A'}, 32),
+	}
+	ip, key := createAddrAndPrivKey(t)
+	list, err := s.createListener(ip, key)
+	require.NoError(t, err)
+
+	newIP := list.Self().IP()
+	assert.Equal(t, exampleIP, newIP.String(), "Did not resolve to expected IP")
 }

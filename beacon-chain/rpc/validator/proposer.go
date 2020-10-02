@@ -11,7 +11,6 @@ import (
 	fastssz "github.com/ferranbt/fastssz"
 	"github.com/pkg/errors"
 	ethpb "github.com/prysmaticlabs/ethereumapis/eth/v1alpha1"
-	"github.com/prysmaticlabs/go-ssz"
 	"github.com/prysmaticlabs/prysm/beacon-chain/cache/depositcache"
 	"github.com/prysmaticlabs/prysm/beacon-chain/core/blocks"
 	"github.com/prysmaticlabs/prysm/beacon-chain/core/feed"
@@ -20,8 +19,8 @@ import (
 	"github.com/prysmaticlabs/prysm/beacon-chain/core/state"
 	"github.com/prysmaticlabs/prysm/beacon-chain/core/state/interop"
 	stateTrie "github.com/prysmaticlabs/prysm/beacon-chain/state"
-	"github.com/prysmaticlabs/prysm/beacon-chain/state/stateutil"
 	dbpb "github.com/prysmaticlabs/prysm/proto/beacon/db"
+	attaggregation "github.com/prysmaticlabs/prysm/shared/aggregation/attestations"
 	"github.com/prysmaticlabs/prysm/shared/bytesutil"
 	"github.com/prysmaticlabs/prysm/shared/featureconfig"
 	"github.com/prysmaticlabs/prysm/shared/hashutil"
@@ -66,9 +65,18 @@ func (vs *Server) GetBlock(ctx context.Context, req *ethpb.BlockRequest) (*ethpb
 		return nil, status.Errorf(codes.Internal, "Could not retrieve head root: %v", err)
 	}
 
+	head, err := vs.HeadFetcher.HeadState(ctx)
+	if err != nil {
+		return nil, status.Errorf(codes.Internal, "Could not get head state %v", err)
+	}
+	head, err = state.ProcessSlots(ctx, head, req.Slot)
+	if err != nil {
+		return nil, status.Errorf(codes.Internal, "Could not advance slot to calculate proposer index: %v", err)
+	}
+
 	var eth1Data *ethpb.Eth1Data
 	if featureconfig.Get().EnableEth1DataMajorityVote {
-		eth1Data, err = vs.eth1DataMajorityVote(ctx, req.Slot)
+		eth1Data, err = vs.eth1DataMajorityVote(ctx, head)
 	} else {
 		eth1Data, err = vs.eth1Data(ctx, req.Slot)
 	}
@@ -77,17 +85,9 @@ func (vs *Server) GetBlock(ctx context.Context, req *ethpb.BlockRequest) (*ethpb
 	}
 
 	// Pack ETH1 deposits which have not been included in the beacon chain.
-	deposits, err := vs.deposits(ctx, eth1Data)
+	deposits, err := vs.deposits(ctx, head, eth1Data)
 	if err != nil {
 		return nil, status.Errorf(codes.Internal, "Could not get ETH1 deposits: %v", err)
-	}
-	head, err := vs.HeadFetcher.HeadState(ctx)
-	if err != nil {
-		return nil, status.Errorf(codes.Internal, "Could not get head state %v", err)
-	}
-	head, err = state.ProcessSlots(ctx, head, req.Slot)
-	if err != nil {
-		return nil, status.Errorf(codes.Internal, "Could not advance slot to calculate proposer index: %v", err)
 	}
 
 	// Pack aggregated attestations which have not been included in the beacon chain.
@@ -109,7 +109,7 @@ func (vs *Server) GetBlock(ctx context.Context, req *ethpb.BlockRequest) (*ethpb
 
 	blk := &ethpb.BeaconBlock{
 		Slot:          req.Slot,
-		ParentRoot:    parentRoot[:],
+		ParentRoot:    parentRoot,
 		StateRoot:     stateRoot,
 		ProposerIndex: idx,
 		Body: &ethpb.BeaconBlockBody{
@@ -138,7 +138,7 @@ func (vs *Server) GetBlock(ctx context.Context, req *ethpb.BlockRequest) (*ethpb
 // ProposeBlock is called by a proposer during its assigned slot to create a block in an attempt
 // to get it processed by the beacon node as the canonical head.
 func (vs *Server) ProposeBlock(ctx context.Context, blk *ethpb.SignedBeaconBlock) (*ethpb.ProposeResponse, error) {
-	root, err := stateutil.BlockRoot(blk.Block)
+	root, err := blk.Block.HashTreeRoot()
 	if err != nil {
 		return nil, status.Errorf(codes.Internal, "Could not tree hash block: %v", err)
 	}
@@ -163,10 +163,6 @@ func (vs *Server) ProposeBlock(ctx context.Context, blk *ethpb.SignedBeaconBlock
 
 	if err := vs.BlockReceiver.ReceiveBlock(ctx, blk, root); err != nil {
 		return nil, status.Errorf(codes.Internal, "Could not process beacon block: %v", err)
-	}
-
-	if err := vs.deleteAttsInPool(ctx, blk.Block.Body.Attestations); err != nil {
-		return nil, status.Errorf(codes.Internal, "Could not delete attestations in pool: %v", err)
 	}
 
 	return &ethpb.ProposeResponse{
@@ -209,20 +205,24 @@ func (vs *Server) eth1Data(ctx context.Context, slot uint64) (*ethpb.Eth1Data, e
 	return eth1Data, nil
 }
 
-// eth1DataMajorityVote determines the appropriate eth1data for a block proposal using an extended
-// simple voting algorithm - voting with the majority. The algorithm for this method is as follows:
-//  - Determine the timestamp for the start slot for the current eth1 voting period.
-//  - Determine the timestamp for the start slot for the previous eth1 voting period.
-//  - Determine the most recent eth1 block before each timestamp.
-//  - Subtract the current period's eth1block.number by ETH1_FOLLOW_DISTANCE to determine the voting upper bound.
-//  - Subtract the previous period's eth1block.number by ETH1_FOLLOW_DISTANCE to determine the voting lower bound.
+// eth1DataMajorityVote determines the appropriate eth1data for a block proposal using
+// an algorithm called Voting with the Majority. The algorithm works as follows:
+//  - Determine the timestamp for the start slot for the eth1 voting period.
+//  - Determine the earliest and latest timestamps that a valid block can have.
+//  - Determine the first block not before the earliest timestamp. This block is the lower bound.
+//  - Determine the last block not after the latest timestamp. This block is the upper bound.
+//  - If the last block is too early, use current eth1data from the beacon state.
 //  - Filter out votes on unknown blocks and blocks which are outside of the range determined by the lower and upper bounds.
-//  - If no blocks are left after filtering, use the current period's most recent eth1 block for proposal.
-//  - Determine the vote with the highest count. Prefer the vote with the highest eth1 block height in the event of a tie.
-//  - This vote's block is the eth1block to use for the block proposal.
-func (vs *Server) eth1DataMajorityVote(ctx context.Context, slot uint64) (*ethpb.Eth1Data, error) {
+//  - If no blocks are left after filtering votes, use eth1data from the latest valid block.
+//  - Otherwise:
+//    - Determine the vote with the highest count. Prefer the vote with the highest eth1 block height in the event of a tie.
+//    - This vote's block is the eth1 block to use for the block proposal.
+func (vs *Server) eth1DataMajorityVote(ctx context.Context, beaconState *stateTrie.BeaconState) (*ethpb.Eth1Data, error) {
 	ctx, cancel := context.WithTimeout(ctx, eth1dataTimeout)
 	defer cancel()
+
+	slot := beaconState.Slot()
+	votingPeriodStartTime := vs.slotStartTime(slot)
 
 	if vs.MockEth1Votes {
 		return vs.mockETH1DataVote(ctx, slot)
@@ -232,47 +232,63 @@ func (vs *Server) eth1DataMajorityVote(ctx context.Context, slot uint64) (*ethpb
 	}
 	eth1DataNotification = false
 
-	slotsPerVotingPeriod := params.BeaconConfig().EpochsPerEth1VotingPeriod * params.BeaconConfig().SlotsPerEpoch
-	currentPeriodVotingStartTime := vs.slotStartTime(slot)
-	// Can't use slotStartTime function because slot would be negative in the initial voting period.
-	previousPeriodVotingStartTime := currentPeriodVotingStartTime -
-		slotsPerVotingPeriod*params.BeaconConfig().SecondsPerSlot
+	eth1FollowDistance := int64(params.BeaconConfig().Eth1FollowDistance)
+	earliestValidTime := votingPeriodStartTime - 2*params.BeaconConfig().SecondsPerETH1Block*uint64(eth1FollowDistance)
+	latestValidTime := votingPeriodStartTime - params.BeaconConfig().SecondsPerETH1Block*uint64(eth1FollowDistance)
 
-	currentPeriodBlockNumber, err := vs.Eth1BlockFetcher.BlockNumberByTimestamp(ctx, currentPeriodVotingStartTime)
+	lastBlockByEarliestValidTime, err := vs.Eth1BlockFetcher.BlockNumberByTimestamp(ctx, earliestValidTime)
 	if err != nil {
-		log.WithError(err).Error("Failed to get block number for current voting period")
+		log.WithError(err).Error("Failed to get last block by earliest valid time")
 		return vs.randomETH1DataVote(ctx)
 	}
-	previousPeriodBlockNumber, err := vs.Eth1BlockFetcher.BlockNumberByTimestamp(ctx, previousPeriodVotingStartTime)
+	timeOfLastBlockByEarliestValidTime, err := vs.Eth1BlockFetcher.BlockTimeByHeight(ctx, lastBlockByEarliestValidTime)
 	if err != nil {
-		log.WithError(err).Error("Failed to get block number for previous voting period")
+		log.WithError(err).Error("Failed to get time of last block by earliest valid time")
 		return vs.randomETH1DataVote(ctx)
 	}
+	// Increment the earliest block if the original block's time is before valid time.
+	// This is very likely to happen because BlockTimeByHeight returns the last block AT OR BEFORE the specified time.
+	if timeOfLastBlockByEarliestValidTime < earliestValidTime {
+		lastBlockByEarliestValidTime = big.NewInt(0).Add(lastBlockByEarliestValidTime, big.NewInt(1))
+	}
 
-	headState, err := vs.HeadFetcher.HeadState(ctx)
+	lastBlockByLatestValidTime, err := vs.Eth1BlockFetcher.BlockNumberByTimestamp(ctx, latestValidTime)
 	if err != nil {
-		return nil, status.Error(codes.Internal, "Could not get head state")
+		log.WithError(err).Error("Failed to get last block by latest valid time")
+		return vs.randomETH1DataVote(ctx)
 	}
-	if len(headState.Eth1DataVotes()) == 0 {
-		eth1Data, err := vs.defaultEth1DataResponse(ctx, currentPeriodBlockNumber)
-		if err != nil {
-			log.WithError(err).Error("Failed to get eth1 data from current period block number")
-			return vs.randomETH1DataVote(ctx)
-		}
-		return eth1Data, nil
+	timeOfLastBlockByLatestValidTime, err := vs.Eth1BlockFetcher.BlockTimeByHeight(ctx, lastBlockByLatestValidTime)
+	if err != nil {
+		log.WithError(err).Error("Failed to get time of last block by latest valid time")
+		return vs.randomETH1DataVote(ctx)
+	}
+	if timeOfLastBlockByLatestValidTime < earliestValidTime {
+		return vs.HeadFetcher.HeadETH1Data(), nil
 	}
 
-	inRangeVotes, err := vs.inRangeVotes(ctx, currentPeriodBlockNumber, previousPeriodBlockNumber)
+	lastBlockDepositCount, lastBlockDepositRoot := vs.DepositFetcher.DepositsNumberAndRootAtHeight(ctx, lastBlockByLatestValidTime)
+	if lastBlockDepositCount == 0 {
+		return vs.ChainStartFetcher.ChainStartEth1Data(), nil
+	}
+
+	inRangeVotes, err := vs.inRangeVotes(ctx, beaconState, lastBlockByEarliestValidTime, lastBlockByLatestValidTime)
 	if err != nil {
 		return nil, err
 	}
 	if len(inRangeVotes) == 0 {
-		eth1Data, err := vs.defaultEth1DataResponse(ctx, currentPeriodBlockNumber)
-		if err != nil {
-			log.WithError(err).Error("Failed to get eth1 data from current period block number")
-			return vs.randomETH1DataVote(ctx)
+		if lastBlockDepositCount >= vs.HeadFetcher.HeadETH1Data().DepositCount {
+			hash, err := vs.Eth1BlockFetcher.BlockHashByHeight(ctx, lastBlockByLatestValidTime)
+			if err != nil {
+				log.WithError(err).Error("Failed to get hash of last block by latest valid time")
+				return vs.randomETH1DataVote(ctx)
+			}
+			return &ethpb.Eth1Data{
+				BlockHash:    hash.Bytes(),
+				DepositCount: lastBlockDepositCount,
+				DepositRoot:  lastBlockDepositRoot[:],
+			}, nil
 		}
-		return eth1Data, nil
+		return vs.HeadFetcher.HeadETH1Data(), nil
 	}
 
 	chosenVote := chosenEth1DataMajorityVote(inRangeVotes)
@@ -287,26 +303,26 @@ func (vs *Server) slotStartTime(slot uint64) uint64 {
 	return startTime
 }
 
-func (vs *Server) inRangeVotes(
-	ctx context.Context,
-	currentPeriodBlockNumber *big.Int,
-	previousPeriodBlockNumber *big.Int) ([]eth1DataSingleVote, error) {
+func (vs *Server) inRangeVotes(ctx context.Context,
+	beaconState *stateTrie.BeaconState,
+	firstValidBlockNumber *big.Int,
+	lastValidBlockNumber *big.Int) ([]eth1DataSingleVote, error) {
 
-	eth1FollowDistance := int64(params.BeaconConfig().Eth1FollowDistance)
-	lastValidBlockNumber := big.NewInt(0).Sub(currentPeriodBlockNumber, big.NewInt(eth1FollowDistance))
-	firstValidBlockNumber := big.NewInt(0).Sub(previousPeriodBlockNumber, big.NewInt(eth1FollowDistance))
-
-	headState, err := vs.HeadFetcher.HeadState(ctx)
-	if err != nil {
-		return nil, status.Error(codes.Internal, "Could not get head state")
-	}
+	currentETH1Data := vs.HeadFetcher.HeadETH1Data()
 
 	var inRangeVotes []eth1DataSingleVote
-	for _, eth1Data := range headState.Eth1DataVotes() {
+	for _, eth1Data := range beaconState.Eth1DataVotes() {
 		ok, height, err := vs.BlockFetcher.BlockExists(ctx, bytesutil.ToBytes32(eth1Data.BlockHash))
 		if err != nil {
 			log.WithError(err).Warning("Could not fetch eth1data height for received eth1data vote")
 		}
+		// Make sure we don't "undo deposit progress". See https://github.com/ethereum/eth2.0-specs/pull/1836
+		if eth1Data.DepositCount < currentETH1Data.DepositCount {
+			continue
+		}
+		// firstValidBlockNumber.Cmp(height) < 1 filters out all blocks before firstValidBlockNumber
+		// lastValidBlockNumber.Cmp(height) > -1 filters out all blocks after lastValidBlockNumber
+		// These filters result in the range [firstValidBlockNumber, lastValidBlockNumber]
 		if ok && firstValidBlockNumber.Cmp(height) < 1 && lastValidBlockNumber.Cmp(height) > -1 {
 			inRangeVotes = append(inRangeVotes, eth1DataSingleVote{eth1Data: *eth1Data, blockHeight: height})
 		}
@@ -385,6 +401,7 @@ func (vs *Server) randomETH1DataVote(ctx context.Context) (*ethpb.Eth1Data, erro
 	if err != nil {
 		return nil, err
 	}
+
 	// set random roots and block hashes to prevent a majority from being
 	// built if the eth1 node is offline
 	randGen := rand.NewGenerator()
@@ -422,17 +439,20 @@ func (vs *Server) computeStateRoot(ctx context.Context, block *ethpb.SignedBeaco
 // this eth1data has enough support to be considered for deposits inclusion. If current vote has
 // enough support, then use that vote for basis of determining deposits, otherwise use current state
 // eth1data.
-func (vs *Server) deposits(ctx context.Context, currentVote *ethpb.Eth1Data) ([]*ethpb.Deposit, error) {
+func (vs *Server) deposits(
+	ctx context.Context,
+	beaconState *stateTrie.BeaconState,
+	currentVote *ethpb.Eth1Data,
+) ([]*ethpb.Deposit, error) {
+	ctx, span := trace.StartSpan(ctx, "ProposerServer.deposits")
+	defer span.End()
+
 	if vs.MockEth1Votes || !vs.Eth1InfoFetcher.IsConnectedToETH1() {
 		return []*ethpb.Deposit{}, nil
 	}
 	// Need to fetch if the deposits up to the state's latest eth 1 data matches
 	// the number of all deposits in this RPC call. If not, then we return nil.
-	headState, err := vs.HeadFetcher.HeadState(ctx)
-	if err != nil {
-		return nil, status.Error(codes.Internal, "Could not get head state")
-	}
-	canonicalEth1Data, canonicalEth1DataHeight, err := vs.canonicalEth1Data(ctx, headState, currentVote)
+	canonicalEth1Data, canonicalEth1DataHeight, err := vs.canonicalEth1Data(ctx, beaconState, currentVote)
 	if err != nil {
 		return nil, err
 	}
@@ -457,7 +477,7 @@ func (vs *Server) deposits(ctx context.Context, currentVote *ethpb.Eth1Data) ([]
 	// deposits are sorted from lowest to highest.
 	var pendingDeps []*dbpb.DepositContainer
 	for _, dep := range allPendingContainers {
-		if uint64(dep.Index) >= headState.Eth1DepositIndex() && uint64(dep.Index) < canonicalEth1Data.DepositCount {
+		if uint64(dep.Index) >= beaconState.Eth1DepositIndex() && uint64(dep.Index) < canonicalEth1Data.DepositCount {
 			pendingDeps = append(pendingDeps, dep)
 		}
 	}
@@ -512,6 +532,9 @@ func (vs *Server) canonicalEth1Data(
 }
 
 func (vs *Server) depositTrie(ctx context.Context, canonicalEth1DataHeight *big.Int) (*trieutil.SparseMerkleTrie, error) {
+	ctx, span := trace.StartSpan(ctx, "ProposerServer.depositTrie")
+	defer span.End()
+
 	var depositTrie *trieutil.SparseMerkleTrie
 
 	var finalizedDeposits *depositcache.FinalizedDeposits
@@ -522,7 +545,7 @@ func (vs *Server) depositTrie(ctx context.Context, canonicalEth1DataHeight *big.
 		insertIndex := finalizedDeposits.MerkleTrieIndex + 1
 
 		for _, dep := range upToEth1DataDeposits {
-			depHash, err := ssz.HashTreeRoot(dep.Data)
+			depHash, err := dep.Data.HashTreeRoot()
 			if err != nil {
 				return nil, errors.Wrap(err, "could not hash deposit data")
 			}
@@ -536,7 +559,7 @@ func (vs *Server) depositTrie(ctx context.Context, canonicalEth1DataHeight *big.
 	upToEth1DataDeposits := vs.DepositFetcher.AllDeposits(ctx, canonicalEth1DataHeight)
 	depositData := [][]byte{}
 	for _, dep := range upToEth1DataDeposits {
-		depHash, err := ssz.HashTreeRoot(dep.Data)
+		depHash, err := dep.Data.HashTreeRoot()
 		if err != nil {
 			return nil, errors.Wrap(err, "could not hash deposit data")
 		}
@@ -571,7 +594,7 @@ func (vs *Server) defaultEth1DataResponse(ctx context.Context, currentHeight *bi
 	if depositsTillHeight == 0 {
 		return vs.ChainStartFetcher.ChainStartEth1Data(), nil
 	}
-	// Check for the validity of deposit count.
+	// // Make sure we don't "undo deposit progress". See https://github.com/ethereum/eth2.0-specs/pull/1836
 	currentETH1Data := vs.HeadFetcher.HeadETH1Data()
 	if depositsTillHeight < currentETH1Data.DepositCount {
 		return currentETH1Data, nil
@@ -588,27 +611,11 @@ func (vs *Server) filterAttestationsForBlockInclusion(ctx context.Context, state
 	ctx, span := trace.StartSpan(ctx, "ProposerServer.filterAttestationsForBlockInclusion")
 	defer span.End()
 
-	validAtts := make([]*ethpb.Attestation, 0, len(atts))
-	inValidAtts := make([]*ethpb.Attestation, 0, len(atts))
-
-	for i, att := range atts {
-		if uint64(i) == params.BeaconConfig().MaxAttestations {
-			break
-		}
-
-		if _, err := blocks.ProcessAttestation(ctx, state, att); err != nil {
-			inValidAtts = append(inValidAtts, att)
-			continue
-
-		}
-		validAtts = append(validAtts, att)
-	}
-
-	if err := vs.deleteAttsInPool(ctx, inValidAtts); err != nil {
+	validAtts, invalidAtts := proposerAtts(atts).filter(ctx, state)
+	if err := vs.deleteAttsInPool(ctx, invalidAtts); err != nil {
 		return nil, err
 	}
-
-	return validAtts, nil
+	return validAtts.sortByProfitability().limitToMaxAttestations(), nil
 }
 
 // The input attestations are processed and seen by the node, this deletes them from pool
@@ -659,13 +666,34 @@ func (vs *Server) packAttestations(ctx context.Context, latestState *stateTrie.B
 	// If there is any room left in the block, consider unaggregated attestations as well.
 	numAtts := uint64(len(atts))
 	if numAtts < params.BeaconConfig().MaxAttestations {
-		uAtts := vs.AttPool.UnaggregatedAttestations()
+		uAtts, err := vs.AttPool.UnaggregatedAttestations()
+		if err != nil {
+			return nil, errors.Wrap(err, "could not get unaggregated attestations")
+		}
 		uAtts, err = vs.filterAttestationsForBlockInclusion(ctx, latestState, uAtts)
-		numUAtts := uint64(len(uAtts))
-		if numUAtts+numAtts > params.BeaconConfig().MaxAttestations {
-			uAtts = uAtts[:params.BeaconConfig().MaxAttestations-numAtts]
+		if err != nil {
+			return nil, errors.Wrap(err, "could not filter attestations")
 		}
 		atts = append(atts, uAtts...)
+
+		attsByDataRoot := make(map[[32]byte][]*ethpb.Attestation, len(atts))
+		for _, att := range atts {
+			attDataRoot, err := att.Data.HashTreeRoot()
+			if err != nil {
+				return nil, err
+			}
+			attsByDataRoot[attDataRoot] = append(attsByDataRoot[attDataRoot], att)
+		}
+
+		attsForInclusion := proposerAtts(make([]*ethpb.Attestation, 0))
+		for _, as := range attsByDataRoot {
+			as, err := attaggregation.Aggregate(as)
+			if err != nil {
+				return nil, err
+			}
+			attsForInclusion = append(attsForInclusion, as...)
+		}
+		atts = attsForInclusion.sortByProfitability().limitToMaxAttestations()
 	}
 	return atts, nil
 }

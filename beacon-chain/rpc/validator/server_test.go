@@ -2,6 +2,7 @@ package validator
 
 import (
 	"context"
+	"sync"
 	"testing"
 	"time"
 
@@ -16,10 +17,10 @@ import (
 	dbutil "github.com/prysmaticlabs/prysm/beacon-chain/db/testing"
 	mockPOW "github.com/prysmaticlabs/prysm/beacon-chain/powchain/testing"
 	stateTrie "github.com/prysmaticlabs/prysm/beacon-chain/state"
-	"github.com/prysmaticlabs/prysm/beacon-chain/state/stateutil"
 	mockSync "github.com/prysmaticlabs/prysm/beacon-chain/sync/initial-sync/testing"
 	pbp2p "github.com/prysmaticlabs/prysm/proto/beacon/p2p/v1"
 	"github.com/prysmaticlabs/prysm/shared/bls"
+	"github.com/prysmaticlabs/prysm/shared/bytesutil"
 	"github.com/prysmaticlabs/prysm/shared/event"
 	"github.com/prysmaticlabs/prysm/shared/mock"
 	"github.com/prysmaticlabs/prysm/shared/params"
@@ -64,11 +65,11 @@ func TestWaitForActivation_ContextClosed(t *testing.T) {
 	require.NoError(t, err)
 	block := testutil.NewBeaconBlock()
 	require.NoError(t, db.SaveBlock(ctx, block), "Could not save genesis block")
-	genesisRoot, err := stateutil.BlockRoot(block.Block)
+	genesisRoot, err := block.Block.HashTreeRoot()
 	require.NoError(t, err, "Could not get signing root")
 
 	ctx, cancel := context.WithCancel(context.Background())
-	depositCache, err := depositcache.NewDepositCache()
+	depositCache, err := depositcache.New()
 	require.NoError(t, err)
 
 	vs := &Server{
@@ -111,38 +112,40 @@ func TestWaitForActivation_ValidatorOriginallyExists(t *testing.T) {
 	priv1 := bls.RandKey()
 	priv2 := bls.RandKey()
 
-	pubKey1 := priv1.PublicKey().Marshal()[:]
-	pubKey2 := priv2.PublicKey().Marshal()[:]
+	pubKey1 := priv1.PublicKey().Marshal()
+	pubKey2 := priv2.PublicKey().Marshal()
 
 	beaconState := &pbp2p.BeaconState{
 		Slot: 4000,
 		Validators: []*ethpb.Validator{
 			{
-				ActivationEpoch: 0,
-				ExitEpoch:       params.BeaconConfig().FarFutureEpoch,
-				PublicKey:       pubKey1,
+				ActivationEpoch:       0,
+				ExitEpoch:             params.BeaconConfig().FarFutureEpoch,
+				PublicKey:             pubKey1,
+				WithdrawalCredentials: make([]byte, 32),
 			},
 		},
 	}
 	block := testutil.NewBeaconBlock()
-	genesisRoot, err := stateutil.BlockRoot(block.Block)
+	genesisRoot, err := block.Block.HashTreeRoot()
 	require.NoError(t, err, "Could not get signing root")
 	depData := &ethpb.Deposit_Data{
 		PublicKey:             pubKey1,
-		WithdrawalCredentials: []byte("hey"),
+		WithdrawalCredentials: bytesutil.PadTo([]byte("hey"), 32),
+		Signature:             make([]byte, 96),
 	}
 	domain, err := helpers.ComputeDomain(params.BeaconConfig().DomainDeposit, nil, nil)
 	require.NoError(t, err)
 	signingRoot, err := helpers.ComputeSigningRoot(depData, domain)
 	require.NoError(t, err)
-	depData.Signature = priv1.Sign(signingRoot[:]).Marshal()[:]
+	depData.Signature = priv1.Sign(signingRoot[:]).Marshal()
 
 	deposit := &ethpb.Deposit{
 		Data: depData,
 	}
 	depositTrie, err := trieutil.NewTrie(int(params.BeaconConfig().DepositContractTreeDepth))
 	require.NoError(t, err, "Could not setup deposit trie")
-	depositCache, err := depositcache.NewDepositCache()
+	depositCache, err := depositcache.New()
 	require.NoError(t, err)
 
 	depositCache.InsertDeposit(ctx, deposit, 10 /*blockNum*/, 0, depositTrie.Root())
@@ -197,9 +200,9 @@ func TestWaitForActivation_MultipleStatuses(t *testing.T) {
 	priv2 := bls.RandKey()
 	priv3 := bls.RandKey()
 
-	pubKey1 := priv1.PublicKey().Marshal()[:]
-	pubKey2 := priv2.PublicKey().Marshal()[:]
-	pubKey3 := priv3.PublicKey().Marshal()[:]
+	pubKey1 := priv1.PublicKey().Marshal()
+	pubKey2 := priv2.PublicKey().Marshal()
+	pubKey3 := priv3.PublicKey().Marshal()
 
 	beaconState := &pbp2p.BeaconState{
 		Slot: 4000,
@@ -224,7 +227,7 @@ func TestWaitForActivation_MultipleStatuses(t *testing.T) {
 		},
 	}
 	block := testutil.NewBeaconBlock()
-	genesisRoot, err := stateutil.BlockRoot(block.Block)
+	genesisRoot, err := block.Block.HashTreeRoot()
 	require.NoError(t, err, "Could not get signing root")
 	trie, err := stateTrie.InitializeFromProtoUnsafe(beaconState)
 	require.NoError(t, err)
@@ -279,8 +282,6 @@ func TestWaitForActivation_MultipleStatuses(t *testing.T) {
 
 func TestWaitForChainStart_ContextClosed(t *testing.T) {
 	db, _ := dbutil.SetupDB(t)
-	ctx := context.Background()
-
 	ctx, cancel := context.WithCancel(context.Background())
 	chainService := &mockChain.ChainService{}
 	Server := &Server{
@@ -297,6 +298,7 @@ func TestWaitForChainStart_ContextClosed(t *testing.T) {
 	ctrl := gomock.NewController(t)
 	defer ctrl.Finish()
 	mockStream := mock.NewMockBeaconNodeValidator_WaitForChainStartServer(ctrl)
+	mockStream.EXPECT().Context().Return(ctx)
 	go func(tt *testing.T) {
 		err := Server.WaitForChainStart(&ptypes.Empty{}, mockStream)
 		assert.ErrorContains(tt, "Context canceled", err)
@@ -334,7 +336,47 @@ func TestWaitForChainStart_AlreadyStarted(t *testing.T) {
 			GenesisTime: uint64(time.Unix(0, 0).Unix()),
 		},
 	).Return(nil)
+	mockStream.EXPECT().Context().Return(context.Background())
 	assert.NoError(t, Server.WaitForChainStart(&ptypes.Empty{}, mockStream), "Could not call RPC method")
+}
+
+func TestWaitForChainStart_HeadStateDoesNotExist(t *testing.T) {
+	db, _ := dbutil.SetupDB(t)
+	genesisValidatorRoot := [32]byte{0x01, 0x02}
+
+	// Set head state to nil
+	chainService := &mockChain.ChainService{State: nil}
+	notifier := chainService.StateNotifier()
+	Server := &Server{
+		Ctx: context.Background(),
+		ChainStartFetcher: &mockPOW.POWChain{
+			ChainFeed: new(event.Feed),
+		},
+		BeaconDB:      db,
+		StateNotifier: chainService.StateNotifier(),
+		HeadFetcher:   chainService,
+	}
+	ctrl := gomock.NewController(t)
+	defer ctrl.Finish()
+	mockStream := mock.NewMockBeaconNodeValidator_WaitForChainStartServer(ctrl)
+	mockStream.EXPECT().Context().Return(context.Background())
+
+	wg := new(sync.WaitGroup)
+	wg.Add(1)
+	go func() {
+		assert.NoError(t, Server.WaitForChainStart(&ptypes.Empty{}, mockStream), "Could not call RPC method")
+		wg.Done()
+	}()
+	// Simulate a late state initialization event, so that
+	// method is able to handle race condition here.
+	notifier.StateFeed().Send(&feed.Event{
+		Type: statefeed.Initialized,
+		Data: &statefeed.InitializedData{
+			StartTime:             time.Unix(0, 0),
+			GenesisValidatorsRoot: genesisValidatorRoot[:],
+		},
+	})
+	testutil.WaitTimeout(wg, time.Second)
 }
 
 func TestWaitForChainStart_NotStartedThenLogFired(t *testing.T) {
@@ -361,6 +403,7 @@ func TestWaitForChainStart_NotStartedThenLogFired(t *testing.T) {
 			GenesisTime: uint64(time.Unix(0, 0).Unix()),
 		},
 	).Return(nil)
+	mockStream.EXPECT().Context().Return(context.Background())
 	go func(tt *testing.T) {
 		assert.NoError(tt, Server.WaitForChainStart(&ptypes.Empty{}, mockStream))
 		<-exitRoutine
@@ -377,13 +420,11 @@ func TestWaitForChainStart_NotStartedThenLogFired(t *testing.T) {
 	}
 
 	exitRoutine <- true
-	testutil.AssertLogsContain(t, hook, "Sending genesis time")
+	require.LogsContain(t, hook, "Sending genesis time")
 }
 
 func TestWaitForSynced_ContextClosed(t *testing.T) {
 	db, _ := dbutil.SetupDB(t)
-	ctx := context.Background()
-
 	ctx, cancel := context.WithCancel(context.Background())
 	chainService := &mockChain.ChainService{}
 	Server := &Server{
@@ -400,6 +441,7 @@ func TestWaitForSynced_ContextClosed(t *testing.T) {
 	ctrl := gomock.NewController(t)
 	defer ctrl.Finish()
 	mockStream := mock.NewMockBeaconNodeValidator_WaitForSyncedServer(ctrl)
+	mockStream.EXPECT().Context().Return(context.Background())
 	go func(tt *testing.T) {
 		err := Server.WaitForSynced(&ptypes.Empty{}, mockStream)
 		assert.ErrorContains(tt, "Context canceled", err)
@@ -438,6 +480,7 @@ func TestWaitForSynced_AlreadySynced(t *testing.T) {
 			GenesisTime: uint64(time.Unix(0, 0).Unix()),
 		},
 	).Return(nil)
+	mockStream.EXPECT().Context().Return(context.Background())
 	assert.NoError(t, Server.WaitForSynced(&ptypes.Empty{}, mockStream), "Could not call RPC method")
 }
 
@@ -465,6 +508,7 @@ func TestWaitForSynced_NotStartedThenLogFired(t *testing.T) {
 			GenesisTime: uint64(time.Unix(0, 0).Unix()),
 		},
 	).Return(nil)
+	mockStream.EXPECT().Context().Return(context.Background())
 	go func(tt *testing.T) {
 		assert.NoError(tt, Server.WaitForSynced(&ptypes.Empty{}, mockStream), "Could not call RPC method")
 		<-exitRoutine
@@ -481,5 +525,5 @@ func TestWaitForSynced_NotStartedThenLogFired(t *testing.T) {
 	}
 
 	exitRoutine <- true
-	testutil.AssertLogsContain(t, hook, "Sending genesis time")
+	require.LogsContain(t, hook, "Sending genesis time")
 }

@@ -15,7 +15,6 @@ import (
 	"github.com/prometheus/client_golang/prometheus"
 	"github.com/prometheus/client_golang/prometheus/promauto"
 	ethpb "github.com/prysmaticlabs/ethereumapis/eth/v1alpha1"
-	"github.com/prysmaticlabs/go-ssz"
 	dbpb "github.com/prysmaticlabs/prysm/proto/beacon/db"
 	"github.com/prysmaticlabs/prysm/shared/bytesutil"
 	"github.com/prysmaticlabs/prysm/shared/params"
@@ -59,8 +58,8 @@ type DepositCache struct {
 	chainStartPubkeys  map[string]bool
 }
 
-// NewDepositCache instantiates a new deposit cache
-func NewDepositCache() (*DepositCache, error) {
+// New instantiates a new deposit cache
+func New() (*DepositCache, error) {
 	finalizedDepositsTrie, err := trieutil.NewTrie(int(params.BeaconConfig().DepositContractTreeDepth))
 	if err != nil {
 		return nil, err
@@ -128,7 +127,7 @@ func (dc *DepositCache) InsertFinalizedDeposits(ctx context.Context, eth1Deposit
 		if d.Index > eth1DepositIndex {
 			break
 		}
-		depHash, err := ssz.HashTreeRoot(d.Deposit.Data)
+		depHash, err := d.Deposit.Data.HashTreeRoot()
 		if err != nil {
 			log.WithError(err).Error("Could not hash deposit data. Finalized deposit cache not updated.")
 			return

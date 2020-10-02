@@ -36,8 +36,6 @@ func (s *Service) goodbyeRPCHandler(ctx context.Context, msg interface{}, stream
 			log.WithError(err).Error("Failed to close stream")
 		}
 	}()
-	ctx, cancel := context.WithTimeout(ctx, ttfbTimeout)
-	defer cancel()
 	SetRPCStreamDeadlines(stream)
 
 	m, ok := msg.(*uint64)
@@ -83,11 +81,6 @@ func (s *Service) sendGoodByeMessage(ctx context.Context, code uint64, id peer.I
 	log := log.WithField("Reason", goodbyeMessage(code))
 	log.WithField("peer", stream.Conn().RemotePeer()).Debug("Sending Goodbye message to peer")
 	return nil
-}
-
-// sends a goodbye message for a generic error
-func (s *Service) sendGenericGoodbyeMessage(ctx context.Context, id peer.ID) error {
-	return s.sendGoodByeMessage(ctx, codeGenericError, id)
 }
 
 func goodbyeMessage(num uint64) string {

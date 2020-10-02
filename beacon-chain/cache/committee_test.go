@@ -89,9 +89,7 @@ func TestCommitteeCache_ActiveCount(t *testing.T) {
 
 func TestCommitteeCache_AddProposerIndicesList(t *testing.T) {
 	cache := NewCommitteesCache()
-
 	seed := [32]byte{'A'}
-	indices := []uint64{1, 2, 3, 4, 5}
 	indices, err := cache.ProposerIndices(seed)
 	require.NoError(t, err)
 	if indices != nil {
@@ -122,7 +120,9 @@ func TestCommitteeCache_CanRotate(t *testing.T) {
 	cache := NewCommitteesCache()
 
 	// Should rotate out all the epochs except 190 through 199.
-	for i := 100; i < 200; i++ {
+	start := 100
+	end := 200
+	for i := start; i < end; i++ {
 		s := []byte(strconv.Itoa(i))
 		item := &Committees{Seed: bytesutil.ToBytes32(s)}
 		require.NoError(t, cache.AddCommitteeShuffledList(item))
@@ -134,7 +134,8 @@ func TestCommitteeCache_CanRotate(t *testing.T) {
 	sort.Slice(k, func(i, j int) bool {
 		return k[i] < k[j]
 	})
-	s := bytesutil.ToBytes32([]byte(strconv.Itoa(190)))
+	wanted := end - int(maxCommitteesCacheSize)
+	s := bytesutil.ToBytes32([]byte(strconv.Itoa(wanted)))
 	assert.Equal(t, key(s), k[0], "incorrect key received for slot 190")
 
 	s = bytesutil.ToBytes32([]byte(strconv.Itoa(199)))

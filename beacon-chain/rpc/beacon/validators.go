@@ -14,7 +14,6 @@ import (
 	statetrie "github.com/prysmaticlabs/prysm/beacon-chain/state"
 	"github.com/prysmaticlabs/prysm/shared/bytesutil"
 	"github.com/prysmaticlabs/prysm/shared/cmd"
-	"github.com/prysmaticlabs/prysm/shared/featureconfig"
 	"github.com/prysmaticlabs/prysm/shared/pagination"
 	"github.com/prysmaticlabs/prysm/shared/params"
 	"google.golang.org/grpc/codes"
@@ -42,8 +41,6 @@ func (bs *Server) ListValidatorBalances(
 		requestedEpoch = q.Epoch
 	case *ethpb.ListValidatorBalancesRequest_Genesis:
 		requestedEpoch = 0
-	default:
-		requestedEpoch = currentEpoch
 	}
 
 	if requestedEpoch > currentEpoch {
@@ -57,7 +54,11 @@ func (bs *Server) ListValidatorBalances(
 	res := make([]*ethpb.ValidatorBalances_Balance, 0)
 	filtered := map[uint64]bool{} // Track filtered validators to prevent duplication in the response.
 
-	requestedState, err := bs.StateGen.StateBySlot(ctx, helpers.StartSlot(requestedEpoch))
+	startSlot, err := helpers.StartSlot(requestedEpoch)
+	if err != nil {
+		return nil, err
+	}
+	requestedState, err := bs.StateGen.StateBySlot(ctx, startSlot)
 	if err != nil {
 		return nil, status.Errorf(codes.Internal, "Could not get state")
 	}
@@ -73,7 +74,11 @@ func (bs *Server) ListValidatorBalances(
 		pubkeyBytes := bytesutil.ToBytes48(pubKey)
 		index, ok := requestedState.ValidatorIndexByPubkey(pubkeyBytes)
 		if !ok {
-			return nil, status.Errorf(codes.NotFound, "Could not find validator index for public key %#x", pubkeyBytes)
+			// We continue the loop if one validator in the request is not found.
+			res = append(res, &ethpb.ValidatorBalances_Balance{
+				Status: "UNKNOWN",
+			})
+			continue
 		}
 
 		filtered[index] = true
@@ -190,23 +195,31 @@ func (bs *Server) ListValidators(
 	var reqState *statetrie.BeaconState
 	var err error
 	if requestedEpoch != currentEpoch {
-		reqState, err = bs.StateGen.StateBySlot(ctx, helpers.StartSlot(requestedEpoch))
+		var s uint64
+		s, err = helpers.StartSlot(requestedEpoch)
+		if err != nil {
+			return nil, err
+		}
+		reqState, err = bs.StateGen.StateBySlot(ctx, s)
 	} else {
 		reqState, err = bs.HeadFetcher.HeadState(ctx)
 	}
-
 	if err != nil {
-		return nil, status.Error(codes.Internal, "Could not get requested state")
+		return nil, status.Errorf(codes.Internal, "Could not get requested state: %v", err)
 	}
 
-	if helpers.StartSlot(requestedEpoch) > reqState.Slot() {
+	s, err := helpers.StartSlot(requestedEpoch)
+	if err != nil {
+		return nil, err
+	}
+	if s > reqState.Slot() {
 		reqState = reqState.Copy()
-		reqState, err = state.ProcessSlots(ctx, reqState, helpers.StartSlot(requestedEpoch))
+		reqState, err = state.ProcessSlots(ctx, reqState, s)
 		if err != nil {
 			return nil, status.Errorf(
 				codes.Internal,
-				"Could not process slots up to %d: %v",
-				helpers.StartSlot(requestedEpoch),
+				"Could not process slots up to epoch %d: %v",
+				requestedEpoch,
 				err,
 			)
 		}
@@ -217,7 +230,7 @@ func (bs *Server) ListValidators(
 	for _, index := range req.Indices {
 		val, err := reqState.ValidatorAtIndex(index)
 		if err != nil {
-			return nil, status.Error(codes.Internal, "Could not get validator")
+			return nil, status.Errorf(codes.Internal, "Could not get validator: %v", err)
 		}
 		validatorList = append(validatorList, &ethpb.Validators_ValidatorContainer{
 			Index:     index,
@@ -237,7 +250,7 @@ func (bs *Server) ListValidators(
 		}
 		val, err := reqState.ValidatorAtIndex(index)
 		if err != nil {
-			return nil, status.Error(codes.Internal, "Could not get validator")
+			return nil, status.Errorf(codes.Internal, "Could not get validator: %v", err)
 		}
 		validatorList = append(validatorList, &ethpb.Validators_ValidatorContainer{
 			Index:     index,
@@ -253,26 +266,13 @@ func (bs *Server) ListValidators(
 		for i := 0; i < reqState.NumValidators(); i++ {
 			val, err := reqState.ValidatorAtIndex(uint64(i))
 			if err != nil {
-				return nil, status.Error(codes.Internal, "Could not get validator")
+				return nil, status.Errorf(codes.Internal, "Could not get validator: %v", err)
 			}
 			validatorList = append(validatorList, &ethpb.Validators_ValidatorContainer{
 				Index:     uint64(i),
 				Validator: val,
 			})
 		}
-	}
-
-	if !featureconfig.Get().NewStateMgmt && requestedEpoch < currentEpoch {
-		stopIdx := len(validatorList)
-		for idx, item := range validatorList {
-			// The first time we see a validator with an activation epoch > the requested epoch,
-			// we know this validator is from the future relative to what the request wants.
-			if item.Validator.ActivationEpoch > requestedEpoch {
-				stopIdx = idx
-				break
-			}
-		}
-		validatorList = validatorList[:stopIdx]
 	}
 
 	// Filter active validators if the request specifies it.
@@ -335,7 +335,7 @@ func (bs *Server) GetValidator(
 	}
 	headState, err := bs.HeadFetcher.HeadState(ctx)
 	if err != nil {
-		return nil, status.Error(codes.Internal, "Could not get head state")
+		return nil, status.Errorf(codes.Internal, "Could not get head state: %v", err)
 	}
 	if requestingIndex {
 		if index >= uint64(headState.NumValidators()) {
@@ -385,12 +385,11 @@ func (bs *Server) GetValidatorActiveSetChanges(
 		)
 	}
 
-	activatedIndices := make([]uint64, 0)
-	exitedIndices := make([]uint64, 0)
-	slashedIndices := make([]uint64, 0)
-	ejectedIndices := make([]uint64, 0)
-
-	requestedState, err := bs.StateGen.StateBySlot(ctx, helpers.StartSlot(requestedEpoch))
+	s, err := helpers.StartSlot(requestedEpoch)
+	if err != nil {
+		return nil, err
+	}
+	requestedState, err := bs.StateGen.StateBySlot(ctx, s)
 	if err != nil {
 		return nil, status.Errorf(codes.Internal, "Could not get state: %v", err)
 	}
@@ -400,13 +399,13 @@ func (bs *Server) GetValidatorActiveSetChanges(
 		return nil, status.Errorf(codes.Internal, "Could not get active validator count: %v", err)
 	}
 	vs := requestedState.Validators()
-	activatedIndices = validators.ActivatedValidatorIndices(helpers.CurrentEpoch(requestedState), vs)
-	exitedIndices, err = validators.ExitedValidatorIndices(helpers.CurrentEpoch(requestedState), vs, activeValidatorCount)
+	activatedIndices := validators.ActivatedValidatorIndices(helpers.CurrentEpoch(requestedState), vs)
+	exitedIndices, err := validators.ExitedValidatorIndices(helpers.CurrentEpoch(requestedState), vs, activeValidatorCount)
 	if err != nil {
 		return nil, status.Errorf(codes.Internal, "Could not determine exited validator indices: %v", err)
 	}
-	slashedIndices = validators.SlashedValidatorIndices(helpers.CurrentEpoch(requestedState), vs)
-	ejectedIndices, err = validators.EjectedValidatorIndices(helpers.CurrentEpoch(requestedState), vs, activeValidatorCount)
+	slashedIndices := validators.SlashedValidatorIndices(helpers.CurrentEpoch(requestedState), vs)
+	ejectedIndices, err := validators.EjectedValidatorIndices(helpers.CurrentEpoch(requestedState), vs, activeValidatorCount)
 	if err != nil {
 		return nil, status.Errorf(codes.Internal, "Could not determine ejected validator indices: %v", err)
 	}
@@ -474,33 +473,46 @@ func (bs *Server) GetValidatorParticipation(
 			requestedEpoch,
 		)
 	}
-
-	requestedState, err := bs.StateGen.StateBySlot(ctx, helpers.StartSlot(requestedEpoch+1))
+	// Calculate the end slot of the next epoch.
+	// Ex: requested epoch 1, this gets slot 95.
+	nextEpochEndSlot, err := helpers.StartSlot(requestedEpoch + 2)
 	if err != nil {
-		return nil, status.Error(codes.Internal, "Could not get state")
+		return nil, err
+	}
+	nextEpochEndSlot--
+	requestedState, err := bs.StateGen.StateBySlot(ctx, nextEpochEndSlot)
+	if err != nil {
+		return nil, status.Errorf(codes.Internal, "Could not get state: %v", err)
 	}
 
 	v, b, err := precompute.New(ctx, requestedState)
 	if err != nil {
-		return nil, status.Error(codes.Internal, "Could not set up pre compute instance")
+		return nil, status.Errorf(codes.Internal, "Could not set up pre compute instance: %v", err)
 	}
 	_, b, err = precompute.ProcessAttestations(ctx, requestedState, v, b)
 	if err != nil {
-		return nil, status.Error(codes.Internal, "Could not pre compute attestations")
+		return nil, status.Errorf(codes.Internal, "Could not pre compute attestations: %v", err)
 	}
-
 	headState, err := bs.HeadFetcher.HeadState(ctx)
 	if err != nil {
-		return nil, status.Error(codes.Internal, "Could not get head state")
+		return nil, status.Errorf(codes.Internal, "Could not get head state: %v", err)
 	}
 
 	return &ethpb.ValidatorParticipationResponse{
 		Epoch:     requestedEpoch,
 		Finalized: requestedEpoch <= headState.FinalizedCheckpointEpoch(),
 		Participation: &ethpb.ValidatorParticipation{
-			GlobalParticipationRate: float32(b.PrevEpochTargetAttested) / float32(b.ActivePrevEpoch),
-			VotedEther:              b.PrevEpochTargetAttested,
-			EligibleEther:           b.ActivePrevEpoch,
+			// TODO(7130): Remove these three deprecated fields.
+			GlobalParticipationRate:          float32(b.PrevEpochTargetAttested) / float32(b.ActivePrevEpoch),
+			VotedEther:                       b.PrevEpochTargetAttested,
+			EligibleEther:                    b.ActivePrevEpoch,
+			CurrentEpochActiveGwei:           b.ActiveCurrentEpoch,
+			CurrentEpochAttestingGwei:        b.CurrentEpochAttested,
+			CurrentEpochTargetAttestingGwei:  b.CurrentEpochTargetAttested,
+			PreviousEpochActiveGwei:          b.ActivePrevEpoch,
+			PreviousEpochAttestingGwei:       b.PrevEpochAttested,
+			PreviousEpochTargetAttestingGwei: b.PrevEpochTargetAttested,
+			PreviousEpochHeadAttestingGwei:   b.PrevEpochHeadAttested,
 		},
 	}, nil
 }
@@ -511,7 +523,7 @@ func (bs *Server) GetValidatorQueue(
 ) (*ethpb.ValidatorQueue, error) {
 	headState, err := bs.HeadFetcher.HeadState(ctx)
 	if err != nil {
-		return nil, status.Error(codes.Internal, "Could not get head state")
+		return nil, status.Errorf(codes.Internal, "Could not get head state: %v", err)
 	}
 	// Queue the validators whose eligible to activate and sort them by activation eligibility epoch number.
 	// Additionally, determine those validators queued to exit
@@ -538,7 +550,6 @@ func (bs *Server) GetValidatorQueue(
 	})
 
 	// Only activate just enough validators according to the activation churn limit.
-	activationQueueChurn := uint64(len(activationQ))
 	activeValidatorCount, err := helpers.ActiveValidatorCount(headState, helpers.CurrentEpoch(headState))
 	if err != nil {
 		return nil, status.Errorf(codes.Internal, "Could not get active validator count: %v", err)
@@ -561,13 +572,9 @@ func (bs *Server) GetValidatorQueue(
 		}
 	}
 	// Prevent churn limit from causing index out of bound issues.
-	if churnLimit < activationQueueChurn {
-		activationQueueChurn = churnLimit
-	}
 	if churnLimit < exitQueueChurn {
 		// If we are above the churn limit, we simply increase the churn by one.
 		exitQueueEpoch++
-		exitQueueChurn = churnLimit
 	}
 
 	// We use the exit queue churn to determine if we have passed a churn limit.
@@ -740,7 +747,11 @@ func (bs *Server) GetIndividualVotes(
 		)
 	}
 
-	requestedState, err := bs.StateGen.StateBySlot(ctx, helpers.StartSlot(req.Epoch))
+	s, err := helpers.StartSlot(req.Epoch)
+	if err != nil {
+		return nil, err
+	}
+	requestedState, err := bs.StateGen.StateBySlot(ctx, s)
 	if err != nil {
 		return nil, status.Errorf(codes.Internal, "Could not retrieve archived state for epoch %d: %v", req.Epoch, err)
 	}
@@ -768,13 +779,13 @@ func (bs *Server) GetIndividualVotes(
 		return filteredIndices[i] < filteredIndices[j]
 	})
 
-	v, b, err := precompute.New(ctx, requestedState)
+	v, bal, err := precompute.New(ctx, requestedState)
 	if err != nil {
 		return nil, status.Errorf(codes.Internal, "Could not set up pre compute instance: %v", err)
 	}
-	v, b, err = precompute.ProcessAttestations(ctx, requestedState, v, b)
+	v, _, err = precompute.ProcessAttestations(ctx, requestedState, v, bal)
 	if err != nil {
-		return nil, status.Error(codes.Internal, "Could not pre compute attestations")
+		return nil, status.Errorf(codes.Internal, "Could not pre compute attestations: %v", err)
 	}
 	vals := requestedState.ValidatorsReadOnly()
 	for _, index := range filteredIndices {

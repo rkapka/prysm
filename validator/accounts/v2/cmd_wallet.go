@@ -18,7 +18,6 @@ var WalletCommands = &cli.Command{
 				"either on-disk (direct), derived, or using remote credentials",
 			Flags: []cli.Flag{
 				flags.WalletDirFlag,
-				flags.WalletPasswordsDirFlag,
 				flags.KeymanagerKindFlag,
 				flags.GrpcRemoteAddressFlag,
 				flags.RemoteSignerCertPathFlag,
@@ -27,9 +26,13 @@ var WalletCommands = &cli.Command{
 				flags.WalletPasswordFileFlag,
 				featureconfig.AltonaTestnet,
 				featureconfig.OnyxTestnet,
+				featureconfig.SpadinaTestnet,
+				featureconfig.ZinkenTestnet,
+				flags.DeprecatedPasswordsDirFlag,
 			},
 			Action: func(cliCtx *cli.Context) error {
-				if _, err := CreateWallet(cliCtx); err != nil {
+				featureconfig.ConfigureValidator(cliCtx)
+				if _, err := CreateAndSaveWalletCli(cliCtx); err != nil {
 					log.Fatalf("Could not create a wallet: %v", err)
 				}
 				return nil
@@ -44,12 +47,15 @@ var WalletCommands = &cli.Command{
 				flags.RemoteSignerCertPathFlag,
 				flags.RemoteSignerKeyPathFlag,
 				flags.RemoteSignerCACertPathFlag,
-				flags.WalletPasswordsDirFlag,
 				featureconfig.AltonaTestnet,
 				featureconfig.OnyxTestnet,
+				featureconfig.SpadinaTestnet,
+				featureconfig.ZinkenTestnet,
+				flags.DeprecatedPasswordsDirFlag,
 			},
 			Action: func(cliCtx *cli.Context) error {
-				if err := EditWalletConfiguration(cliCtx); err != nil {
+				featureconfig.ConfigureValidator(cliCtx)
+				if err := EditWalletConfigurationCli(cliCtx); err != nil {
 					log.Fatalf("Could not edit wallet configuration: %v", err)
 				}
 				return nil
@@ -60,15 +66,18 @@ var WalletCommands = &cli.Command{
 			Usage: "uses a derived wallet seed recovery phase to recreate an existing HD wallet",
 			Flags: []cli.Flag{
 				flags.WalletDirFlag,
-				flags.WalletPasswordsDirFlag,
 				flags.MnemonicFileFlag,
 				flags.WalletPasswordFileFlag,
 				flags.NumAccountsFlag,
 				featureconfig.AltonaTestnet,
 				featureconfig.OnyxTestnet,
+				featureconfig.SpadinaTestnet,
+				featureconfig.ZinkenTestnet,
+				flags.DeprecatedPasswordsDirFlag,
 			},
 			Action: func(cliCtx *cli.Context) error {
-				if err := RecoverWallet(cliCtx); err != nil {
+				featureconfig.ConfigureValidator(cliCtx)
+				if err := RecoverWalletCli(cliCtx); err != nil {
 					log.Fatalf("Could not recover wallet: %v", err)
 				}
 				return nil

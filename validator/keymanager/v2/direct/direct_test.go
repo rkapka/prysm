@@ -3,13 +3,14 @@ package direct
 import (
 	"context"
 	"encoding/json"
+	"fmt"
 	"strings"
 	"testing"
 
 	validatorpb "github.com/prysmaticlabs/prysm/proto/validator/accounts/v2"
 	"github.com/prysmaticlabs/prysm/shared/bls"
 	"github.com/prysmaticlabs/prysm/shared/bytesutil"
-	"github.com/prysmaticlabs/prysm/shared/testutil"
+	"github.com/prysmaticlabs/prysm/shared/petnames"
 	"github.com/prysmaticlabs/prysm/shared/testutil/assert"
 	"github.com/prysmaticlabs/prysm/shared/testutil/require"
 	mock "github.com/prysmaticlabs/prysm/validator/accounts/v2/testing"
@@ -26,12 +27,11 @@ func TestDirectKeymanager_CreateAccount(t *testing.T) {
 		WalletPassword: password,
 	}
 	dr := &Keymanager{
-		keysCache:     make(map[[48]byte]bls.SecretKey),
 		wallet:        wallet,
 		accountsStore: &AccountStore{},
 	}
 	ctx := context.Background()
-	accountName, err := dr.CreateAccount(ctx)
+	createdPubKey, err := dr.CreateAccount(ctx)
 	require.NoError(t, err)
 
 	// Ensure the keystore file was written to the wallet
@@ -59,8 +59,58 @@ func TestDirectKeymanager_CreateAccount(t *testing.T) {
 	require.NoError(t, err)
 	pubKey := privKey.PublicKey().Marshal()
 	assert.DeepEqual(t, pubKey, store.PublicKeys[0])
-	testutil.AssertLogsContain(t, hook, accountName)
-	testutil.AssertLogsContain(t, hook, "Successfully created new validator account")
+	require.LogsContain(t, hook, petnames.DeterministicName(createdPubKey, "-"))
+	require.LogsContain(t, hook, "Successfully created new validator account")
+}
+
+func TestDirectKeymanager_RemoveAccounts(t *testing.T) {
+	hook := logTest.NewGlobal()
+	password := "secretPassw0rd$1999"
+	wallet := &mock.Wallet{
+		Files:          make(map[string]map[string][]byte),
+		WalletPassword: password,
+	}
+	dr := &Keymanager{
+		wallet:        wallet,
+		accountsStore: &AccountStore{},
+	}
+	numAccounts := 5
+	ctx := context.Background()
+	for i := 0; i < numAccounts; i++ {
+		_, err := dr.CreateAccount(ctx)
+		require.NoError(t, err)
+	}
+	accounts, err := dr.FetchValidatingPublicKeys(ctx)
+	require.NoError(t, err)
+	require.Equal(t, numAccounts, len(accounts))
+
+	accountToRemove := uint64(2)
+	accountPubKey := accounts[accountToRemove]
+	// Remove an account from the keystore.
+	require.NoError(t, dr.DeleteAccounts(ctx, [][]byte{accountPubKey[:]}))
+	// Ensure the keystore file was written to the wallet
+	// and ensure we can decrypt it using the EIP-2335 standard.
+	var encodedKeystore []byte
+	for k, v := range wallet.Files[AccountsPath] {
+		if strings.Contains(k, "keystore") {
+			encodedKeystore = v
+		}
+	}
+	require.NotNil(t, encodedKeystore, "could not find keystore file")
+	keystoreFile := &v2keymanager.Keystore{}
+	require.NoError(t, json.Unmarshal(encodedKeystore, keystoreFile))
+
+	// We extract the accounts from the keystore.
+	decryptor := keystorev4.New()
+	encodedAccounts, err := decryptor.Decrypt(keystoreFile.Crypto, password)
+	require.NoError(t, err, "Could not decrypt validator accounts")
+	store := &AccountStore{}
+	require.NoError(t, json.Unmarshal(encodedAccounts, store))
+
+	require.Equal(t, numAccounts-1, len(store.PublicKeys))
+	require.Equal(t, numAccounts-1, len(store.PrivateKeys))
+	require.LogsContain(t, hook, fmt.Sprintf("%#x", bytesutil.Trunc(accountPubKey[:])))
+	require.LogsContain(t, hook, "Successfully deleted validator account")
 }
 
 func TestDirectKeymanager_FetchValidatingPublicKeys(t *testing.T) {
@@ -71,7 +121,6 @@ func TestDirectKeymanager_FetchValidatingPublicKeys(t *testing.T) {
 	}
 	dr := &Keymanager{
 		wallet:        wallet,
-		keysCache:     make(map[[48]byte]bls.SecretKey),
 		accountsStore: &AccountStore{},
 	}
 	// First, generate accounts and their keystore.json files.
@@ -81,24 +130,18 @@ func TestDirectKeymanager_FetchValidatingPublicKeys(t *testing.T) {
 	for i := 0; i < numAccounts; i++ {
 		privKey := bls.RandKey()
 		pubKey := bytesutil.ToBytes48(privKey.PublicKey().Marshal())
-		dr.keysCache[pubKey] = privKey
 		wantedPubKeys[i] = pubKey
 		dr.accountsStore.PublicKeys = append(dr.accountsStore.PublicKeys, pubKey[:])
 		dr.accountsStore.PrivateKeys = append(dr.accountsStore.PrivateKeys, privKey.Marshal())
 	}
-
+	require.NoError(t, dr.initializeKeysCachesFromKeystore())
 	publicKeys, err := dr.FetchValidatingPublicKeys(ctx)
 	require.NoError(t, err)
-	// The results are not guaranteed to be ordered, so we ensure each
-	// key we expect exists in the results via a map.
-	keysMap := make(map[[48]byte]bool)
-	for _, key := range publicKeys {
-		keysMap[key] = true
-	}
-	for _, wanted := range wantedPubKeys {
-		if _, ok := keysMap[wanted]; !ok {
-			t.Errorf("Could not find expected public key %#x in results", wanted)
-		}
+	assert.Equal(t, numAccounts, len(publicKeys))
+	// FetchValidatingPublicKeys is also used in generating the output of account list
+	// therefore the results must be in the same order as the order in which the accounts were derived
+	for i, key := range wantedPubKeys {
+		assert.Equal(t, key, publicKeys[i])
 	}
 }
 
@@ -112,7 +155,6 @@ func TestDirectKeymanager_Sign(t *testing.T) {
 	dr := &Keymanager{
 		wallet:        wallet,
 		accountsStore: &AccountStore{},
-		keysCache:     make(map[[48]byte]bls.SecretKey),
 	}
 
 	// First, generate accounts and their keystore.json files.
@@ -142,14 +184,8 @@ func TestDirectKeymanager_Sign(t *testing.T) {
 	require.NoError(t, json.Unmarshal(enc, store))
 	require.Equal(t, len(store.PublicKeys), len(store.PrivateKeys))
 	require.NotEqual(t, 0, len(store.PublicKeys))
-
-	for i := 0; i < len(store.PublicKeys); i++ {
-		privKey, err := bls.SecretKeyFromBytes(store.PrivateKeys[i])
-		require.NoError(t, err)
-		dr.keysCache[bytesutil.ToBytes48(store.PublicKeys[i])] = privKey
-	}
 	dr.accountsStore = store
-
+	require.NoError(t, dr.initializeKeysCachesFromKeystore())
 	publicKeys, err := dr.FetchValidatingPublicKeys(ctx)
 	require.NoError(t, err)
 	require.Equal(t, len(publicKeys), len(store.PublicKeys))
@@ -188,8 +224,60 @@ func TestDirectKeymanager_Sign_NoPublicKeyInCache(t *testing.T) {
 		PublicKey: []byte("hello world"),
 	}
 	dr := &Keymanager{
-		keysCache: make(map[[48]byte]bls.SecretKey),
+		secretKeysCache: make(map[[48]byte]bls.SecretKey),
 	}
 	_, err := dr.Sign(context.Background(), req)
 	assert.ErrorContains(t, "no signing key found in keys cache", err)
+}
+
+func TestDirectKeymanager_RefreshWalletPassword(t *testing.T) {
+	password := "secretPassw0rd$1999"
+	wallet := &mock.Wallet{
+		Files:            make(map[string]map[string][]byte),
+		AccountPasswords: make(map[string]string),
+		WalletPassword:   password,
+	}
+	dr := &Keymanager{
+		wallet:        wallet,
+		accountsStore: &AccountStore{},
+	}
+
+	ctx := context.Background()
+	numAccounts := 5
+	for i := 0; i < numAccounts; i++ {
+		_, err := dr.CreateAccount(ctx)
+		require.NoError(t, err)
+	}
+
+	var encodedKeystore []byte
+	for k, v := range wallet.Files[AccountsPath] {
+		if strings.Contains(k, "keystore") {
+			encodedKeystore = v
+		}
+	}
+	keystoreFile := &v2keymanager.Keystore{}
+	require.NoError(t, json.Unmarshal(encodedKeystore, keystoreFile))
+
+	// We attempt to decrypt with the wallet password and expect no error.
+	decryptor := keystorev4.New()
+	_, err := decryptor.Decrypt(keystoreFile.Crypto, dr.wallet.Password())
+	require.NoError(t, err)
+
+	// We change the wallet password.
+	wallet.WalletPassword = "NewPassw0rdz9**#"
+	// Attempting to decrypt with this new wallet password should fail.
+	_, err = decryptor.Decrypt(keystoreFile.Crypto, dr.wallet.Password())
+	require.ErrorContains(t, "invalid checksum", err)
+
+	// Call the refresh wallet password method, then attempting to decrypt should work.
+	require.NoError(t, dr.RefreshWalletPassword(ctx))
+	for k, v := range wallet.Files[AccountsPath] {
+		if strings.Contains(k, "keystore") {
+			encodedKeystore = v
+		}
+	}
+	keystoreFile = &v2keymanager.Keystore{}
+	require.NoError(t, json.Unmarshal(encodedKeystore, keystoreFile))
+	_, err = decryptor.Decrypt(keystoreFile.Crypto, dr.wallet.Password())
+	require.NoError(t, err)
 }
